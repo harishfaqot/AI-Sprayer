@@ -14,10 +14,11 @@ session = ort.InferenceSession(
 input_name = session.get_inputs()[0].name
 
 # Camera
-cap = cv2.VideoCapture("video/grass2.mp4")
+# cap = cv2.VideoCapture("video/grass2.mp4")
+cap = cv2.VideoCapture(0)
 
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+# cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+# cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
 
 prev = time.time()
 
