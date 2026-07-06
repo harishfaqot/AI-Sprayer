@@ -21,7 +21,7 @@ import socket
 from flask import Flask, Response, render_template_string, request, jsonify
 
 # ── CONFIG ──────────────────────────────────────────────────────────────────
-MODEL_PATH   = r"runs/segment/train-6/weights/best.pt"
+MODEL_PATH   = r"runs/segment/train-8/weights/best.pt"
 SOURCE       = "video/grass4.mp4"   # 0 = webcam, or "path/to/video.mp4"
 DEVICE       = "cpu"                # "cpu" or "cuda"
 CONF         = 0.4

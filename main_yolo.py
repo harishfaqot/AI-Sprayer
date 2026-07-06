@@ -17,8 +17,8 @@ import time
 import math
 
 # ── CONFIG ──────────────────────────────────────────────────────────────────
-MODEL_PATH   = r"runs\segment\train-6\weights\best.pt"
-SOURCE       = "video/grass4.mp4"   # 0 = webcam, or "path/to/video.mp4"
+MODEL_PATH   = r"runs\segment\train-8\weights\best.pt"
+SOURCE       = "video/vgrass1.mp4"   # 0 = webcam, or "path/to/video.mp4"
 DEVICE       = "cpu"                # "cpu" or "cuda" or 0
 CONF         = 0.4
 IMGSZ        = 640

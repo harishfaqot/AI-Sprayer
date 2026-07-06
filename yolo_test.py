@@ -2,10 +2,13 @@ from ultralytics import YOLO
 import cv2
 
 # Load model on GPU
-model = YOLO(r"runs\segment\train-6\weights\best.pt")
+# model = YOLO(r"runs\segment\train-6\weights\best.pt")
+# model = YOLO("yolo26n.pt")
+# model = YOLO("yolo26n.onnx")
+model = YOLO("yolo26n-seg.pt")
 # model.to("cuda")
 
-cap = cv2.VideoCapture("video/grass4.mp4")
+cap = cv2.VideoCapture("people.mp4")
 
 while True:
     ret, frame = cap.read()
