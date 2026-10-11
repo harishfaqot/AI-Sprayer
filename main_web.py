@@ -7,6 +7,9 @@ Stream:  /video_feed   → MJPEG (realtime annotated video)
 Stats:   /stats_stream → SSE  (nozzle %, servo angle, pump state, FPS, etc.)
 Control: /api/start    → POST
          /api/stop     → POST
+PID:     /api/pid          → GET gains/metrics, POST {loop, kp, ki, kd}
+         /api/pid/history  → GET ?since=t  (SP / PV / u samples)
+         /api/pid/step     → POST start step-response test
 
 CONFIG: Edit the variables below, then run.
 """
@@ -20,6 +23,7 @@ import json
 import io
 import socket
 from flask import Flask, Response, render_template_string, request, jsonify
+from pid_control import ControlSystem
 
 # ── CONFIG ──────────────────────────────────────────────────────────────────
 MODEL_PATH   = r"runs/segment/train-9/weights/best.pt"
@@ -48,7 +52,7 @@ NOZZLE_HEIGHT = 1.0    # nozzle height above ground, in units of ROI half-width
 SERVO_CENTER  = 90     # deg (nozzle pointing straight down)
 SERVO_RANGE   = 60     # max +/- deg pan from center
 SERVO_INVERT  = False  # True if servo turns the opposite way
-SERVO_SMOOTH  = 0.35   # 0..1, lower = slower servo motion (simulated)
+# Servo / nozzle dynamics + PID gains → pid_control.py
 DIR_DEADBAND  = 5      # |pan| deg below this = CENTER
 
 # Colors (BGR for OpenCV overlay)
@@ -67,7 +71,9 @@ state = {
     "running":       False,
     "grass_detected": False,
     "pump_on":        False,
-    "nozzle_pct":     0,
+    "nozzle_pct":     0,       # actual opening (PID PV)
+    "nozzle_sp":      0,       # opening setpoint from vision
+    "servo_sp":       0.0,     # pan setpoint from vision (deg)
     "grass_area_px":  0,
     "roi_grass_px":   0,
     "roi_coverage":   0.0,
@@ -86,6 +92,7 @@ latest_frame = None   # JPEG bytes of latest annotated frame
 model        = None
 cap          = None
 _worker      = None
+control      = ControlSystem()   # PID loops run in their own thread
 
 # ── SSE helpers ──────────────────────────────────────────────────────────────
 sse_clients = []
@@ -168,7 +175,7 @@ def _draw_overlay(frame, s, roi, roi_mask, centroid_x):
     py     = max(int(50 * k), ry1 - int(40 * k))
     pan    = math.radians(s["servo_pan"])
     hit_x  = int(px + s["hit_pos"] * (rx2 - rx1) / 2)
-    if spraying:
+    if spraying and s["nozzle_pct"] > 1:
         half_w = int((rx2 - rx1) * (0.03 + 0.10 * s["nozzle_pct"] / 100))
         spray = frame.copy()
         pts = np.array([[px, py], [hit_x - half_w, ry2], [hit_x + half_w, ry2]], np.int32)
@@ -178,7 +185,10 @@ def _draw_overlay(frame, s, roi, roi_mask, centroid_x):
     # Pan range arc + nozzle arm
     arm = int(45 * k)
     cv2.ellipse(frame, (px, py), (arm, arm), 90, -SERVO_RANGE, SERVO_RANGE, COL_GRAY, t1)
-    tip = (int(px + arm * math.sin(pan)), int(py + arm * math.cos(pan)))
+    sp_pan = math.radians(s["servo_sp"])
+    sp_tip = (int(px + arm * 1.3 * math.sin(sp_pan)), int(py + arm * 1.3 * math.cos(sp_pan)))
+    cv2.line(frame, (px, py), sp_tip, COL_RED, t1)              # setpoint (SP)
+    tip = (int(px + arm * math.sin(pan)), int(py + arm * math.cos(pan)))   # actual (PV)
     cv2.line(frame, (px, py), tip, (255, 255, 255), int(7 * k))
     cv2.line(frame, (px, py), tip, COL_CYAN if spraying else COL_GRAY, int(4 * k))
     sw, sh = int(18 * k), int(12 * k)
@@ -195,6 +205,8 @@ def _draw_overlay(frame, s, roi, roi_mask, centroid_x):
     pump_col  = COL_GREEN if spraying else COL_RED
     cv2.putText(frame, pump_txt, (int(10 * k), ty), cv2.FONT_HERSHEY_SIMPLEX, fs, pump_col, t2)
     cv2.putText(frame, f"NOZZLE: {s['nozzle_pct']}%", (int(150 * k), ty), cv2.FONT_HERSHEY_SIMPLEX, fs, COL_BLUE, t2)
+    cv2.putText(frame, f"TARGET {s['nozzle_sp']}%  {s['servo_sp']:+.0f}deg", (int(640 * k), ty),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5 * k, COL_GRAY, t1)
     cv2.putText(frame, f"SERVO: {s['servo_angle']:.0f}deg {s['direction']}", (int(330 * k), ty),
                 cv2.FONT_HERSHEY_SIMPLEX, fs, COL_CYAN, t2)
     cv2.putText(frame, f"FPS: {s['fps']}", (w - int(105 * k), ty), cv2.FONT_HERSHEY_SIMPLEX, 0.55 * k, COL_GRAY, t1)
@@ -203,7 +215,6 @@ def detection_loop():
     global latest_frame, cap
     frame_count = 0
     last_time   = time.time()
-    servo_pan   = 0.0   # deg
 
     # Video file → skip frames so playback follows wall-clock time
     src_fps   = cap.get(cv2.CAP_PROP_FPS) or 0
@@ -253,7 +264,7 @@ def detection_loop():
             # Opening from grass area in ROI
             ratio      = min(1.0, coverage / COVERAGE_FULL)
             nozzle_pct = int(round(NOZZLE_MIN + (100 - NOZZLE_MIN) * ratio))
-            # Aim servo at grass centroid inside ROI
+            # Aim servo at grass centroid inside ROI (→ PID setpoint)
             m          = cv2.moments(roi_mask, binaryImage=True)
             centroid_x = rx1 + m["m10"] / m["m00"]
             offset     = (centroid_x - (rx1 + rx2) / 2) / max((rx2 - rx1) / 2, 1)  # -1..1
@@ -263,8 +274,11 @@ def detection_loop():
             nozzle_pct = 0
             target     = 0.0   # point straight down
 
-        # Simulated servo motion (no hardware yet)
-        servo_pan  += (target - servo_pan) * SERVO_SMOOTH
+        # Setpoints → PID loops; read back actual (simulated) actuator state
+        control.set_targets(target, nozzle_pct)
+        pid         = control.snapshot()
+        servo_pan   = pid["servo_pv"]
+        nozzle_act  = int(round(pid["nozzle_pv"]))
         hit_pos     = math.tan(math.radians(servo_pan)) * NOZZLE_HEIGHT
         sign        = -1 if SERVO_INVERT else 1
         servo_angle = SERVO_CENTER + sign * servo_pan
@@ -285,7 +299,9 @@ def detection_loop():
             state.update({
                 "grass_detected":  grass_detected,
                 "pump_on":         pump_on,
-                "nozzle_pct":      nozzle_pct,
+                "nozzle_pct":      nozzle_act,
+                "nozzle_sp":       nozzle_pct,
+                "servo_sp":        round(pid["servo_sp"], 1),
                 "grass_area_px":   int(total_area),
                 "roi_grass_px":    int(roi_px),
                 "roi_coverage":    round(coverage * 100, 1),
@@ -307,13 +323,17 @@ def detection_loop():
 
         # Push stats via SSE
         push_sse({k: s[k] for k in (
-            "pump_on", "nozzle_pct", "grass_detected", "grass_area_px",
+            "pump_on", "nozzle_pct", "nozzle_sp", "servo_sp", "grass_detected", "grass_area_px",
             "roi_grass_px", "roi_coverage", "servo_pan", "hit_pos", "servo_angle",
             "direction", "n_detected", "detect_count", "fps")})
 
         time.sleep(0.01)
 
-    # Release cap when stopped
+    # Release cap when stopped, park actuators
+    control.set_targets(0.0, 0.0)
+    path = control.stop_log()
+    if path:
+        print(f"[AI Sprayer] PID log saved: {path}")
     if cap:
         cap.release()
 
@@ -386,10 +406,11 @@ def api_start():
         state["detect_count"] = 0
         state["source"]       = str(source)
 
+    log_path = control.start_log("run")
     _worker = threading.Thread(target=detection_loop, daemon=True)
     _worker.start()
     push_sse({"event": "started", "source": str(source)})
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "log": log_path})
 
 
 @app.route("/api/stop", methods=["POST"])
@@ -404,6 +425,32 @@ def api_stop():
 def api_state():
     with state_lock:
         return jsonify(dict(state))
+
+
+@app.route("/api/pid", methods=["GET", "POST"])
+def api_pid():
+    if request.method == "POST":
+        d = request.get_json(silent=True) or {}
+        if d.get("loop") not in ("servo", "nozzle"):
+            return jsonify({"ok": False, "msg": "loop must be 'servo' or 'nozzle'"})
+        try:
+            control.set_gains(d["loop"], d.get("kp"), d.get("ki"), d.get("kd"))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "msg": "invalid gain value"})
+    return jsonify({"ok": True, "gains": control.gains(), "metrics": control.metrics,
+                    "mode": control.mode, "log": control.log_path, **control.snapshot()})
+
+
+@app.route("/api/pid/history")
+def api_pid_history():
+    since = request.args.get("since", -1.0, type=float)
+    return jsonify({"now": control.snapshot()["t"], "samples": control.get_history(since)})
+
+
+@app.route("/api/pid/step", methods=["POST"])
+def api_pid_step():
+    ok = control.start_step_test()
+    return jsonify({"ok": ok, "msg": "" if ok else "Step test already running"})
 
 
 # ── HTML Page ─────────────────────────────────────────────────────────────────
@@ -601,6 +648,37 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .log-box .log-line { color: var(--muted); }
   .log-box .log-line span { color: var(--txt); }
 
+  /* PID panel */
+  .pid-card { margin-top: 12px; }
+  .pid-charts { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 700px) { .pid-charts { grid-template-columns: 1fr; } }
+  .pid-chart canvas { width: 100%; height: 150px; display: block;
+                      background: var(--card); border-radius: 6px; }
+  .pid-chart-hdr { display: flex; justify-content: space-between; align-items: baseline;
+                   font-size: 0.65rem; color: var(--muted); margin-bottom: 4px; }
+  .pid-chart-hdr b { color: var(--txt); }
+  .legend i { display: inline-block; width: 14px; height: 2px; vertical-align: middle; margin: 0 3px 0 8px; }
+  .gains { display: flex; gap: 6px; margin-top: 8px; align-items: center; flex-wrap: wrap; }
+  .gains label { font-size: 0.6rem; color: var(--muted); }
+  .gains input { width: 66px; font-family: inherit; font-size: 0.7rem; padding: 4px 6px;
+                 border: 1px solid var(--border); border-radius: 5px; background: var(--card); color: var(--txt); }
+  .btn-gry { background: var(--txt); color: #fff; }
+  .metrics { width: 100%; border-collapse: collapse; font-size: 0.65rem; margin-top: 8px; }
+  .metrics th, .metrics td { padding: 3px 4px; text-align: right; border-bottom: 1px solid var(--border); }
+  .metrics th { color: var(--muted); font-weight: 600; }
+  .metrics td:first-child, .metrics th:first-child { text-align: left; }
+  .pid-actions { display: flex; gap: 8px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
+  .pid-note { font-size: 0.62rem; color: var(--muted); }
+  .help { font-size: 0.68rem; color: var(--muted); line-height: 1.6; margin-bottom: 10px; }
+  .help b { color: var(--txt); }
+  .help ul { margin: 4px 0 0 16px; }
+  details.help summary { cursor: pointer; color: var(--blu); font-weight: 600; }
+  .vlegend { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 10px;
+             font-size: 0.65rem; color: var(--muted); }
+  .vlegend span { display: inline-flex; align-items: center; gap: 5px; }
+  .sw { width: 14px; height: 10px; border-radius: 2px; display: inline-block; }
+  .sw.line { height: 3px; }
+
   /* Pulse animation for dot */
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
   .dot.on { animation: pulse 1.5s infinite; }
@@ -632,6 +710,84 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <input type="text" id="srcInput" value="{{ source }}" placeholder="0 = webcam | path/to/video.mp4">
       <button class="btn btn-grn" id="btnStart" onclick="startStream()">▶ START</button>
       <button class="btn btn-red" id="btnStop" onclick="stopStream()" disabled>■ STOP</button>
+    </div>
+
+    <!-- Video legend -->
+    <div class="vlegend">
+      <span><i class="sw" style="border:2px solid #FFD700"></i>Spray area (waiting)</span>
+      <span><i class="sw" style="border:2px solid #53D339"></i>Spray area (spraying)</span>
+      <span><i class="sw" style="background:#F85149;opacity:.6"></i>Grass inside spray area</span>
+      <span><b style="color:#F85149">+</b>Grass center (where to aim)</span>
+      <span><i class="sw line" style="background:#F85149"></i>Target angle</span>
+      <span><i class="sw line" style="background:#00DCFF;height:5px"></i>Actual nozzle angle</span>
+      <span><i class="sw" style="background:#00DCFF;opacity:.4"></i>Spray</span>
+    </div>
+
+    <!-- PID response -->
+    <div class="card pid-card">
+      <div class="card-title">▸ PID Control <span id="pidMode" style="float:right"></span></div>
+
+      <details class="help">
+        <summary>What is this? (click to read)</summary>
+        <p style="margin-top:6px">The camera decides a <b>target</b> for two servos:
+          the <b>angle servo</b> (aims the nozzle left/right at the grass) and the
+          <b>nozzle servo</b> (opens the nozzle more when there is more grass).
+          The target changes every frame and can jump. The <b>PID controller</b> moves each servo
+          toward its target smoothly: fast when far, slowing down when close, without
+          overshooting or shaking. It runs 200 times per second, in software only.</p>
+        <ul>
+          <li><b>Kp</b> (push): higher = reacts faster. Too high = overshoots / shakes.</li>
+          <li><b>Ki</b> (fix leftover error): keep small. Too high = overshoots and goes slow to settle.</li>
+          <li><b>Kd</b> (brake): higher = less overshoot. Too high = sluggish / jittery.</li>
+        </ul>
+        <p style="margin-top:4px"><b>STEP TEST</b> sends fixed targets (angle 0 → +30° → −30° → 0,
+          nozzle 0 → 80% → 30% → 0) to measure how good the tuning is.
+          Servos are simulated for now (no hardware connected).</p>
+      </details>
+
+      <div class="pid-charts">
+        <div class="pid-chart">
+          <div class="pid-chart-hdr">
+            <span><b>Angle servo</b> (degree, − left / + right)</span>
+            <span class="legend"><i style="background:#DC2626"></i>Target<i style="background:#2563EB"></i>Actual</span>
+          </div>
+          <canvas id="chartServo"></canvas>
+          <div class="gains">
+            <label title="Push: bigger = faster">Kp</label><input id="servo_kp" type="number" step="any">
+            <label title="Fix leftover error: keep small">Ki</label><input id="servo_ki" type="number" step="any">
+            <label title="Brake: bigger = less overshoot">Kd</label><input id="servo_kd" type="number" step="any">
+            <button class="btn btn-gry" onclick="applyGains('servo')">APPLY</button>
+          </div>
+        </div>
+        <div class="pid-chart">
+          <div class="pid-chart-hdr">
+            <span><b>Nozzle servo</b> (opening %)</span>
+            <span class="legend"><i style="background:#DC2626"></i>Target<i style="background:#2563EB"></i>Actual</span>
+          </div>
+          <canvas id="chartNozzle"></canvas>
+          <div class="gains">
+            <label title="Push: bigger = faster">Kp</label><input id="nozzle_kp" type="number" step="any">
+            <label title="Fix leftover error: keep small">Ki</label><input id="nozzle_ki" type="number" step="any">
+            <label title="Brake: bigger = less overshoot">Kd</label><input id="nozzle_kd" type="number" step="any">
+            <button class="btn btn-gry" onclick="applyGains('nozzle')">APPLY</button>
+          </div>
+        </div>
+      </div>
+      <div class="pid-note" style="margin-top:6px">Good tuning: the blue line follows the red dashed line quickly, without going past it.</div>
+      <div class="pid-actions">
+        <button class="btn btn-grn" id="btnStep" onclick="stepTest()">STEP TEST</button>
+        <span class="pid-note" id="pidLog">CSV log: —</span>
+      </div>
+      <div class="help" id="metricsHelp" hidden style="margin:8px 0 0">
+        <b>Rise</b> = time to get from 10% to 90% of the way (smaller = faster) ·
+        <b>Overshoot</b> = how far it went past the target (smaller = better) ·
+        <b>Settling</b> = time until it stays at the target ±2% (smaller = better) ·
+        <b>Error</b> = what is left at the end (closer to 0 = better)
+      </div>
+      <table class="metrics" id="metricsTable" hidden>
+        <thead><tr><th>Servo</th><th>Target change</th><th>Rise (s)</th><th>Overshoot</th><th>Settling (s)</th><th>Error</th></tr></thead>
+        <tbody></tbody>
+      </table>
     </div>
   </div>
 
@@ -673,13 +829,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <text x="155" y="100" font-family="JetBrains Mono" font-size="9" fill="#71717A">100</text>
         </svg>
         <div class="nozzle-pct" id="nozzlePct">0%</div>
+        <div class="detect-count" id="nozzleSp">Target: 0%</div>
         <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
       </div>
     </div>
 
     <!-- Servo -->
     <div class="card">
-      <div class="card-title">▸ Nozzle Servo (Pan)</div>
+      <div class="card-title">▸ Angle Servo</div>
       <svg width="100%" height="90" viewBox="0 0 240 90">
         <!-- ground / ROI width -->
         <line x1="20" y1="80" x2="220" y2="80" stroke="#E4E4E7" stroke-width="6" stroke-linecap="round"/>
@@ -692,7 +849,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <text x="8" y="84" font-family="JetBrains Mono" font-size="9" fill="#71717A">L</text>
         <text x="226" y="84" font-family="JetBrains Mono" font-size="9" fill="#71717A">R</text>
       </svg>
-      <div class="stat-row"><span class="stat-key">Angle</span><span class="stat-val" id="servoAngle">90°</span></div>
+      <div class="stat-row"><span class="stat-key">Actual angle</span><span class="stat-val" id="servoAngle">90°</span></div>
+      <div class="stat-row"><span class="stat-key">Target</span><span class="stat-val" id="servoSp">0°</span></div>
       <div class="stat-row"><span class="stat-key">Direction</span><span class="stat-val" id="servoDir">CENTER</span></div>
     </div>
 
@@ -759,39 +917,145 @@ function updateUI(d) {
   pump.className = "pump-box" + (d.pump_on ? " on" : "");
   pump.textContent = d.pump_on ? "PUMP  ON" : "PUMP  OFF";
 
-  // Nozzle gauge
-  const pct = d.nozzle_pct ?? 0;
-  const offset = GAUGE_LEN * (1 - pct / 100);
-  const fill = document.getElementById("gaugeFill");
-  fill.setAttribute("stroke-dashoffset", offset);
-  fill.setAttribute("stroke", pct < 60 ? "#16A34A" : pct < 85 ? "#D97706" : "#DC2626");
-
-  // Needle: -90deg (0%) to +90deg (100%)
-  const deg = -90 + (pct / 100) * 180;
-  document.getElementById("gaugeNeedle").style.transform = `rotate(${deg}deg)`;
-
-  document.getElementById("nozzlePct").textContent = `${pct}%`;
-  const pf = document.getElementById("progressFill");
-  pf.style.width = `${pct}%`;
-  pf.style.background = pct < 60 ? "var(--grn)" : pct < 85 ? "var(--ylw)" : "var(--red)";
-
   // Stats
   document.getElementById("statArea").textContent   = `${(d.grass_area_px ?? 0).toLocaleString()} px²`;
   document.getElementById("statRoiArea").textContent  = `${(d.roi_grass_px ?? 0).toLocaleString()} px²`;
   document.getElementById("statCoverage").textContent = `${d.roi_coverage ?? 0}%`;
 
-  // Servo: fixed at center, pans nozzle toward hit point
-  const pan = (d.servo_pan ?? 0) * Math.PI / 180;
-  const hx  = 120 + Math.max(-1, Math.min(1, d.hit_pos ?? 0)) * 100;
-  const arm = document.getElementById("servoArm");
-  arm.setAttribute("x2", 120 + 26 * Math.sin(pan));
-  arm.setAttribute("y2", 14 + 26 * Math.cos(pan));
-  arm.setAttribute("stroke", d.pump_on ? "#0EA5E9" : "#A1A1AA");
-  const hw  = d.pump_on ? 6 + 20 * pct / 100 : 0;
-  document.getElementById("servoSpray").setAttribute("points", `120,14 ${hx - hw},80 ${hx + hw},80`);
-  document.getElementById("servoAngle").textContent = `${d.servo_angle ?? 90}°`;
+  lastPump = !!d.pump_on;
   document.getElementById("servoDir").textContent   = d.direction ?? "CENTER";
   document.getElementById("statInst").textContent   = d.n_detected ?? 0;
+}
+
+// ── Actuators (PID PV) ────────────────────────────────────────────────────────
+const SERVO_INVERT = {{ servo_invert }};
+const NOZZLE_HEIGHT = {{ nozzle_height }};
+let lastPump = false;
+
+function updateActuators(p) {
+  // Nozzle gauge = actual opening
+  const pct = Math.round(p.nozzle_pv);
+  const fill = document.getElementById("gaugeFill");
+  fill.setAttribute("stroke-dashoffset", GAUGE_LEN * (1 - pct / 100));
+  fill.setAttribute("stroke", pct < 60 ? "#16A34A" : pct < 85 ? "#D97706" : "#DC2626");
+  document.getElementById("gaugeNeedle").style.transform = `rotate(${-90 + pct * 1.8}deg)`;
+  document.getElementById("nozzlePct").textContent = `${pct}%`;
+  document.getElementById("nozzleSp").textContent  = `Target: ${Math.round(p.nozzle_sp)}%`;
+  const pf = document.getElementById("progressFill");
+  pf.style.width = `${pct}%`;
+  pf.style.background = pct < 60 ? "var(--grn)" : pct < 85 ? "var(--ylw)" : "var(--red)";
+
+  // Servo = actual pan angle
+  const pan = p.servo_pv * Math.PI / 180;
+  const hit = Math.max(-1, Math.min(1, Math.tan(pan) * NOZZLE_HEIGHT));
+  const hx  = 120 + hit * 100;
+  const arm = document.getElementById("servoArm");
+  const spraying = (lastPump || p.mode === "step") && pct > 1;
+  arm.setAttribute("x2", 120 + 26 * Math.sin(pan));
+  arm.setAttribute("y2", 14 + 26 * Math.cos(pan));
+  arm.setAttribute("stroke", spraying ? "#0EA5E9" : "#A1A1AA");
+  const hw  = spraying ? 6 + 20 * pct / 100 : 0;
+  document.getElementById("servoSpray").setAttribute("points", `120,14 ${hx - hw},80 ${hx + hw},80`);
+  const ang = 90 + (SERVO_INVERT ? -1 : 1) * p.servo_pv;
+  document.getElementById("servoAngle").textContent = `${ang.toFixed(1)}°`;
+  document.getElementById("servoSp").textContent    = `${p.servo_sp >= 0 ? "+" : ""}${p.servo_sp.toFixed(1)}° pan`;
+}
+
+// ── PID charts ────────────────────────────────────────────────────────────────
+const WINDOW_S = 10;
+let pidHist = [], pidSince = -1, pidNow = 0, lastMode = "vision";
+
+function drawChart(id, iSp, iPv, iU, yMin, yMax, uMin) {
+  const cv = document.getElementById(id);
+  const dpr = window.devicePixelRatio || 1;
+  const W = cv.clientWidth, H = cv.clientHeight;
+  if (cv.width !== W * dpr) { cv.width = W * dpr; cv.height = H * dpr; }
+  const g = cv.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, W, H);
+  const L = 30, R = 6, T = 6, B = 16;
+  const t0 = pidNow - WINDOW_S;
+  const X = t => L + (t - t0) / WINDOW_S * (W - L - R);
+  const Y = v => T + (1 - (v - yMin) / (yMax - yMin)) * (H - T - B);
+  const YU = u => T + (1 - (u - uMin) / (1 - uMin)) * (H - T - B);
+
+  g.font = "9px JetBrains Mono, monospace"; g.fillStyle = "#71717A"; g.strokeStyle = "#E4E4E7"; g.lineWidth = 1;
+  for (let k = 0; k <= 4; k++) {
+    const v = yMin + (yMax - yMin) * k / 4, y = Y(v);
+    g.beginPath(); g.moveTo(L, y); g.lineTo(W - R, y); g.stroke();
+    g.fillText(Math.round(v), 2, y + 3);
+  }
+  for (let s = 0; s <= WINDOW_S; s += 2) g.fillText(`-${WINDOW_S - s}s`, X(t0 + s) - 8, H - 3);
+
+  const pts = pidHist.filter(h => h[0] >= t0);
+  const line = (fn, col, w, dash) => {
+    g.strokeStyle = col; g.lineWidth = w; g.setLineDash(dash || []); g.beginPath();
+    pts.forEach((h, k) => { const x = X(h[0]), y = fn(h); k ? g.lineTo(x, y) : g.moveTo(x, y); });
+    g.stroke(); g.setLineDash([]);
+  };
+  line(h => Y(h[iSp]), "#DC2626", 1.5, [4, 3]);
+  line(h => Y(h[iPv]), "#2563EB", 2);
+}
+
+async function pollPid() {
+  try {
+    const r = await fetch(`/api/pid/history?since=${pidSince}`);
+    const d = await r.json();
+    if (d.samples.length) {
+      if (d.samples[0][0] < pidSince) pidHist = [];
+      pidHist.push(...d.samples);
+      pidSince = d.samples[d.samples.length - 1][0];
+      pidHist = pidHist.filter(h => h[0] >= pidSince - WINDOW_S - 1);
+    }
+    pidNow = d.now;
+    drawChart("chartServo",  1, 2, 3, -60, 60, -1);
+    drawChart("chartNozzle", 4, 5, 6,   0, 100, -1);
+
+    const p = await (await fetch("/api/pid")).json();
+    updateActuators(p);
+    document.getElementById("pidMode").textContent = p.mode === "step" ? "STEP TEST…" : "";
+    document.getElementById("btnStep").disabled = p.mode === "step";
+    if (p.log) document.getElementById("pidLog").textContent = `CSV log: ${p.log}`;
+    if (lastMode === "step" && p.mode !== "step") { showMetrics(p.metrics); log("Step test done."); }
+    lastMode = p.mode;
+  } catch (e) {}
+  setTimeout(pollPid, 200);
+}
+
+function fillGains(g) {
+  for (const loop of ["servo", "nozzle"])
+    for (const k of ["kp", "ki", "kd"])
+      document.getElementById(`${loop}_${k}`).value = g[loop][k];
+}
+
+async function applyGains(loop) {
+  const v = k => parseFloat(document.getElementById(`${loop}_${k}`).value);
+  const body = {loop, kp: v("kp"), ki: v("ki"), kd: v("kd")};
+  const d = await (await fetch("/api/pid", {method: "POST",
+    headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)})).json();
+  if (d.ok) { fillGains(d.gains); log(`${loop} gains → Kp=${body.kp} Ki=${body.ki} Kd=${body.kd}`); }
+  else log(`ERROR: ${d.msg}`);
+}
+
+async function stepTest() {
+  const d = await (await fetch("/api/pid/step", {method: "POST"})).json();
+  log(d.ok ? "Step test started." : `ERROR: ${d.msg}`);
+}
+
+function showMetrics(m) {
+  const tb = document.querySelector("#metricsTable tbody");
+  tb.innerHTML = "";
+  for (const loop of ["servo", "nozzle"]) {
+    const unit = loop === "servo" ? "°" : "%";
+    for (const r of (m[loop] || [])) {
+      tb.innerHTML += `<tr><td>${loop === "servo" ? "Angle" : "Nozzle"}</td><td>${r.from}→${r.to}${unit}</td>` +
+        `<td>${r.rise_time ?? "—"}</td><td>${r.overshoot_pct}%</td>` +
+        `<td>${r.settling_time}</td><td>${r.sse}${unit}</td></tr>`;
+    }
+  }
+  document.getElementById("metricsTable").hidden = false;
+  document.getElementById("metricsHelp").hidden  = false;
+  if (m.log) document.getElementById("pidLog").textContent = `CSV log: ${m.log}`;
 }
 
 // ── Controls ──────────────────────────────────────────────────────────────────
@@ -861,10 +1125,18 @@ fetch("/api/state").then(r => r.json()).then(d => {
   }
   updateUI(d);
 });
+
+fetch("/api/pid").then(r => r.json()).then(p => {
+  fillGains(p.gains);
+  if (p.metrics && p.metrics.servo) showMetrics(p.metrics);
+});
+pollPid();
 </script>
 </body>
 </html>
-""".replace("{{ source }}", str(SOURCE))
+""".replace("{{ source }}", str(SOURCE)) \
+ .replace("{{ servo_invert }}", "true" if SERVO_INVERT else "false") \
+ .replace("{{ nozzle_height }}", str(NOZZLE_HEIGHT))
 
 
 # ── Run ────────────────────────────────────────────────────────────────────────
