@@ -4,7 +4,7 @@ AI Sprayer - Web Dashboard
 Open http://<YOUR_PC_IP>:5000 from any device on the same network.
 
 Stream:  /video_feed   → MJPEG (realtime annotated video)
-Stats:   /stats_stream → SSE  (nozzle %, pump state, FPS, etc.)
+Stats:   /stats_stream → SSE  (nozzle %, servo angle, pump state, FPS, etc.)
 Control: /api/start    → POST
          /api/stop     → POST
 
@@ -12,6 +12,7 @@ CONFIG: Edit the variables below, then run.
 """
 
 import cv2
+import numpy as np
 import threading
 import time
 import math
@@ -21,21 +22,42 @@ import socket
 from flask import Flask, Response, render_template_string, request, jsonify
 
 # ── CONFIG ──────────────────────────────────────────────────────────────────
-MODEL_PATH   = r"runs/segment/train-8/weights/best.pt"
-SOURCE       = "video/grass4.mp4"   # 0 = webcam, or "path/to/video.mp4"
+MODEL_PATH   = r"runs/segment/train-9/weights/best.pt"
+SOURCE       = "video/real1.mp4"   # 0 = webcam, or "path/to/video.mp4"
 DEVICE       = "cpu"                # "cpu" or "cuda"
+REALTIME     = True                 # video file: skip frames to keep real-time speed
+PROCESS_WIDTH = 1280                # resize frames to this width (0 = keep original)
 CONF         = 0.4
 IMGSZ        = 640
 PORT         = 5000
 
-HEIGHT_MIN   = 30
-HEIGHT_MAX   = 480
+# ── Spray ROI (fractions of frame) ──
+# Horizontal band in the middle of the frame = area the nozzle can reach.
+ROI_X1       = 0.10    # left edge  (0..1 of width)
+ROI_X2       = 0.90    # right edge (0..1 of width)
+ROI_Y_CENTER = 0.80    # band center (0..1 of height)
+ROI_H        = 0.25    # band height (0..1 of height)
+
+# ── Nozzle opening ──
+MIN_SPRAY_PX  = 400    # min grass pixels inside ROI to turn pump on
+COVERAGE_FULL = 0.30   # ROI coverage that gives 100% opening
+NOZZLE_MIN    = 20     # opening % when pump just turns on
+
+# ── Servo (fixed at center, pans nozzle left/right) ──
+NOZZLE_HEIGHT = 1.0    # nozzle height above ground, in units of ROI half-width
+SERVO_CENTER  = 90     # deg (nozzle pointing straight down)
+SERVO_RANGE   = 60     # max +/- deg pan from center
+SERVO_INVERT  = False  # True if servo turns the opposite way
+SERVO_SMOOTH  = 0.35   # 0..1, lower = slower servo motion (simulated)
+DIR_DEADBAND  = 5      # |pan| deg below this = CENTER
 
 # Colors (BGR for OpenCV overlay)
 COL_GREEN    = (57, 211, 83)
 COL_RED      = (73, 81, 248)
 COL_BLUE     = (255, 166, 88)
 COL_GRAY     = (158, 148, 139)
+COL_YELLOW   = (0, 215, 255)
+COL_CYAN     = (255, 220, 0)
 # ────────────────────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
@@ -47,7 +69,12 @@ state = {
     "pump_on":        False,
     "nozzle_pct":     0,
     "grass_area_px":  0,
-    "grass_height_px":0,
+    "roi_grass_px":   0,
+    "roi_coverage":   0.0,
+    "servo_pan":      0.0,     # deg, - left / + right
+    "hit_pos":        0.0,     # spray hit point on ground, -1 (left) .. +1 (right) of ROI
+    "servo_angle":    SERVO_CENTER,
+    "direction":      "CENTER",
     "n_detected":     0,
     "detect_count":   0,
     "fps":            0,
@@ -86,67 +113,162 @@ def load_model():
 threading.Thread(target=load_model, daemon=True).start()
 
 # ── Detection loop ────────────────────────────────────────────────────────────
-def _draw_overlay(frame, s):
+def roi_rect(w, h):
+    x1 = int(ROI_X1 * w)
+    x2 = int(ROI_X2 * w)
+    y1 = int((ROI_Y_CENTER - ROI_H / 2) * h)
+    y2 = int((ROI_Y_CENTER + ROI_H / 2) * h)
+    return max(0, x1), max(0, y1), min(w, x2), min(h, y2)
+
+
+def grass_mask_from_result(result, shape):
+    """Binary mask (frame size) of all detected grass."""
+    h, w = shape[:2]
+    mask = np.zeros((h, w), np.uint8)
+    if result.masks is not None:
+        for poly in result.masks.xy:
+            if len(poly) >= 3:
+                cv2.fillPoly(mask, [poly.astype(np.int32)], 255)
+    elif result.boxes is not None:
+        for x1, y1, x2, y2 in result.boxes.xyxy.tolist():
+            cv2.rectangle(mask, (int(x1), int(y1)), (int(x2), int(y2)), 255, -1)
+    return mask
+
+
+def _draw_overlay(frame, s, roi, roi_mask, centroid_x):
     h, w = frame.shape[:2]
-    cv2.rectangle(frame, (0, 0), (w, 38), (23, 17, 13), -1)
-    pump_txt  = "PUMP: ON" if s["pump_on"] else "PUMP: OFF"
-    pump_col  = COL_GREEN if s["pump_on"] else COL_RED
-    cv2.putText(frame, pump_txt,          (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.65, pump_col, 2)
-    cv2.putText(frame, f"NOZZLE: {s['nozzle_pct']}%", (170, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.65, COL_BLUE, 2)
-    cv2.putText(frame, f"FPS: {s['fps']}", (w - 105, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.55, COL_GRAY, 1)
+    rx1, ry1, rx2, ry2 = roi
+    spraying = s["pump_on"]
 
-    # Height bar (right edge)
-    bar_h  = min(h - 60, 200)
-    bar_x  = w - 30
-    bar_y1 = h - 20 - bar_h
-    bar_y2 = h - 20
-    fill   = int((s["nozzle_pct"] / 100) * bar_h)
-    cv2.rectangle(frame, (bar_x, bar_y1), (bar_x + 16, bar_y2), (45, 36, 30), -1)
-    if fill > 0:
-        col = COL_GREEN if s["nozzle_pct"] < 60 else (65, 179, 227) if s["nozzle_pct"] < 85 else COL_RED
-        cv2.rectangle(frame, (bar_x, bar_y2 - fill), (bar_x + 16, bar_y2), col, -1)
-    cv2.putText(frame, "H", (bar_x + 2, bar_y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.4, COL_GRAY, 1)
+    # ROI band + grass inside ROI highlighted
+    layer = frame.copy()
+    rec_color = COL_GREEN if spraying else COL_YELLOW
+    cv2.rectangle(layer, (rx1, ry1), (rx2, ry2), rec_color, -1)
+    frame[:] = cv2.addWeighted(layer, 0.12, frame, 0.88, 0)
+    roi_view = frame[ry1:ry2, rx1:rx2]
+    tint = np.zeros_like(roi_view)
+    tint[:] = COL_RED
+    sel = roi_mask > 0
+    roi_view[sel] = cv2.addWeighted(roi_view, 0.5, tint, 0.5, 0)[sel]
+    k  = w / 1280          # scale drawing to frame resolution
+    t1 = max(1, int(round(1 * k)))
+    t2 = max(2, int(round(2 * k)))
+    roi_col = COL_GREEN if spraying else COL_YELLOW
+    cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), roi_col, t2)
+    cv2.putText(frame, "SPRAY AREA", (rx1 + int(6 * k), ry2 - int(8 * k)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5 * k, roi_col, t1)
 
+    # Grass centroid (servo target)
+    if centroid_x is not None:
+        cv2.drawMarker(frame, (int(centroid_x), (ry1 + ry2) // 2), COL_RED,
+                       cv2.MARKER_CROSS, int(22 * k), t2)
+
+    # Servo fixed at ROI center, nozzle pans toward hit point on the ground
+    px     = (rx1 + rx2) // 2
+    py     = max(int(50 * k), ry1 - int(40 * k))
+    pan    = math.radians(s["servo_pan"])
+    hit_x  = int(px + s["hit_pos"] * (rx2 - rx1) / 2)
+    if spraying:
+        half_w = int((rx2 - rx1) * (0.03 + 0.10 * s["nozzle_pct"] / 100))
+        spray = frame.copy()
+        pts = np.array([[px, py], [hit_x - half_w, ry2], [hit_x + half_w, ry2]], np.int32)
+        cv2.fillPoly(spray, [pts], COL_CYAN)
+        frame[:] = cv2.addWeighted(spray, 0.30, frame, 0.70, 0)
+
+    # Pan range arc + nozzle arm
+    arm = int(45 * k)
+    cv2.ellipse(frame, (px, py), (arm, arm), 90, -SERVO_RANGE, SERVO_RANGE, COL_GRAY, t1)
+    tip = (int(px + arm * math.sin(pan)), int(py + arm * math.cos(pan)))
+    cv2.line(frame, (px, py), tip, (255, 255, 255), int(7 * k))
+    cv2.line(frame, (px, py), tip, COL_CYAN if spraying else COL_GRAY, int(4 * k))
+    sw, sh = int(18 * k), int(12 * k)
+    cv2.rectangle(frame, (px - sw, py - sh), (px + sw, py + sh), (40, 40, 40), -1)
+    cv2.circle(frame, (px, py), int(6 * k), (255, 255, 255), -1)
+    cv2.putText(frame, f"{s['servo_angle']:.0f}deg", (px + sw + int(6 * k), py + int(5 * k)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5 * k, (255, 255, 255), t1)
+
+    # Top status bar
+    fs = 0.65 * k
+    ty = int(26 * k)
+    cv2.rectangle(frame, (0, 0), (w, int(38 * k)), (23, 17, 13), -1)
+    pump_txt  = "PUMP: ON" if spraying else "PUMP: OFF"
+    pump_col  = COL_GREEN if spraying else COL_RED
+    cv2.putText(frame, pump_txt, (int(10 * k), ty), cv2.FONT_HERSHEY_SIMPLEX, fs, pump_col, t2)
+    cv2.putText(frame, f"NOZZLE: {s['nozzle_pct']}%", (int(150 * k), ty), cv2.FONT_HERSHEY_SIMPLEX, fs, COL_BLUE, t2)
+    cv2.putText(frame, f"SERVO: {s['servo_angle']:.0f}deg {s['direction']}", (int(330 * k), ty),
+                cv2.FONT_HERSHEY_SIMPLEX, fs, COL_CYAN, t2)
+    cv2.putText(frame, f"FPS: {s['fps']}", (w - int(105 * k), ty), cv2.FONT_HERSHEY_SIMPLEX, 0.55 * k, COL_GRAY, t1)
 
 def detection_loop():
     global latest_frame, cap
     frame_count = 0
     last_time   = time.time()
+    servo_pan   = 0.0   # deg
+
+    # Video file → skip frames so playback follows wall-clock time
+    src_fps   = cap.get(cv2.CAP_PROP_FPS) or 0
+    is_file   = REALTIME and cap.get(cv2.CAP_PROP_FRAME_COUNT) > 0 and src_fps > 0
+    start_t   = time.time()
+    frame_idx = 0
 
     while state["running"]:
+        if is_file:
+            target_idx = int((time.time() - start_t) * src_fps)
+            ok = True
+            while frame_idx < target_idx and ok:
+                ok = cap.grab()
+                frame_idx += 1
         ret, frame = cap.read()
+        frame_idx += 1
         if not ret:
             with state_lock:
                 state["running"] = False
             push_sse({"event": "stopped", "reason": "end_of_source"})
             break
 
+        if PROCESS_WIDTH and frame.shape[1] > PROCESS_WIDTH:
+            scale = PROCESS_WIDTH / frame.shape[1]
+            frame = cv2.resize(frame, (PROCESS_WIDTH, int(frame.shape[0] * scale)),
+                               interpolation=cv2.INTER_AREA)
+
         results     = model(frame, device=DEVICE, conf=CONF, imgsz=IMGSZ, verbose=False)
-        annotated   = results[0].plot()
-        boxes       = results[0].boxes
-        masks       = results[0].masks
-        n_detected  = len(boxes) if boxes is not None else 0
+        result      = results[0]
+        annotated   = result.plot()
+        n_detected  = len(result.boxes) if result.boxes is not None else 0
 
-        total_area = 0
-        max_height = 0
-        if n_detected > 0:
-            for box in boxes.xyxy:
-                x1, y1, x2, y2 = box.tolist()
-                w = x2 - x1
-                h = y2 - y1
-                total_area += w * h
-                if h > max_height:
-                    max_height = h
-            if masks is not None:
-                total_area = int(masks.data.sum().item())
+        # Grass inside spray ROI
+        fh, fw     = frame.shape[:2]
+        roi        = roi_rect(fw, fh)
+        rx1, ry1, rx2, ry2 = roi
+        grass_mask = grass_mask_from_result(result, frame.shape)
+        roi_mask   = grass_mask[ry1:ry2, rx1:rx2]
+        total_area = cv2.countNonZero(grass_mask)
+        roi_px     = cv2.countNonZero(roi_mask)
+        coverage   = roi_px / max(roi_mask.size, 1)
 
-        grass_detected  = n_detected > 0
-        pump_on         = grass_detected and max_height >= HEIGHT_MIN
+        grass_detected = n_detected > 0
+        pump_on        = roi_px >= MIN_SPRAY_PX
+        centroid_x     = None
         if pump_on:
-            pct = (max_height - HEIGHT_MIN) / max(HEIGHT_MAX - HEIGHT_MIN, 1)
-            nozzle_pct = min(100, max(0, int(pct * 100)))
+            # Opening from grass area in ROI
+            ratio      = min(1.0, coverage / COVERAGE_FULL)
+            nozzle_pct = int(round(NOZZLE_MIN + (100 - NOZZLE_MIN) * ratio))
+            # Aim servo at grass centroid inside ROI
+            m          = cv2.moments(roi_mask, binaryImage=True)
+            centroid_x = rx1 + m["m10"] / m["m00"]
+            offset     = (centroid_x - (rx1 + rx2) / 2) / max((rx2 - rx1) / 2, 1)  # -1..1
+            target     = math.degrees(math.atan2(offset, NOZZLE_HEIGHT))
+            target     = max(-SERVO_RANGE, min(SERVO_RANGE, target))
         else:
             nozzle_pct = 0
+            target     = 0.0   # point straight down
+
+        # Simulated servo motion (no hardware yet)
+        servo_pan  += (target - servo_pan) * SERVO_SMOOTH
+        hit_pos     = math.tan(math.radians(servo_pan)) * NOZZLE_HEIGHT
+        sign        = -1 if SERVO_INVERT else 1
+        servo_angle = SERVO_CENTER + sign * servo_pan
+        direction   = "LEFT" if servo_pan < -DIR_DEADBAND else "RIGHT" if servo_pan > DIR_DEADBAND else "CENTER"
 
         # FPS
         frame_count += 1
@@ -165,13 +287,18 @@ def detection_loop():
                 "pump_on":         pump_on,
                 "nozzle_pct":      nozzle_pct,
                 "grass_area_px":   int(total_area),
-                "grass_height_px": int(max_height),
+                "roi_grass_px":    int(roi_px),
+                "roi_coverage":    round(coverage * 100, 1),
+                "servo_pan":       round(servo_pan, 1),
+                "hit_pos":         round(hit_pos, 3),
+                "servo_angle":     round(servo_angle, 1),
+                "direction":       direction,
                 "n_detected":      n_detected,
                 "fps":             fps,
             })
             s = dict(state)
 
-        _draw_overlay(annotated, s)
+        _draw_overlay(annotated, s, roi, roi_mask, centroid_x)
 
         # Encode to JPEG
         _, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 75])
@@ -179,16 +306,10 @@ def detection_loop():
             latest_frame = buf.tobytes()
 
         # Push stats via SSE
-        push_sse({
-            "pump_on":         s["pump_on"],
-            "nozzle_pct":      s["nozzle_pct"],
-            "grass_detected":  s["grass_detected"],
-            "grass_area_px":   s["grass_area_px"],
-            "grass_height_px": s["grass_height_px"],
-            "n_detected":      s["n_detected"],
-            "detect_count":    s["detect_count"],
-            "fps":             s["fps"],
-        })
+        push_sse({k: s[k] for k in (
+            "pump_on", "nozzle_pct", "grass_detected", "grass_area_px",
+            "roi_grass_px", "roi_coverage", "servo_pan", "hit_pos", "servo_angle",
+            "direction", "n_detected", "detect_count", "fps")})
 
         time.sleep(0.01)
 
@@ -556,11 +677,31 @@ HTML_PAGE = r"""<!DOCTYPE html>
       </div>
     </div>
 
+    <!-- Servo -->
+    <div class="card">
+      <div class="card-title">▸ Nozzle Servo (Pan)</div>
+      <svg width="100%" height="90" viewBox="0 0 240 90">
+        <!-- ground / ROI width -->
+        <line x1="20" y1="80" x2="220" y2="80" stroke="#E4E4E7" stroke-width="6" stroke-linecap="round"/>
+        <line x1="120" y1="74" x2="120" y2="86" stroke="#A1A1AA" stroke-width="1"/>
+        <polygon id="servoSpray" points="120,14 120,80 120,80" fill="#0EA5E9" opacity="0.3"/>
+        <!-- servo body + arm -->
+        <line id="servoArm" x1="120" y1="14" x2="120" y2="40" stroke="#A1A1AA" stroke-width="5" stroke-linecap="round"/>
+        <rect x="108" y="6" width="24" height="16" rx="3" fill="#27272A"/>
+        <circle cx="120" cy="14" r="3" fill="#fff"/>
+        <text x="8" y="84" font-family="JetBrains Mono" font-size="9" fill="#71717A">L</text>
+        <text x="226" y="84" font-family="JetBrains Mono" font-size="9" fill="#71717A">R</text>
+      </svg>
+      <div class="stat-row"><span class="stat-key">Angle</span><span class="stat-val" id="servoAngle">90°</span></div>
+      <div class="stat-row"><span class="stat-key">Direction</span><span class="stat-val" id="servoDir">CENTER</span></div>
+    </div>
+
     <!-- Stats -->
     <div class="card">
       <div class="card-title">▸ Measurements</div>
-      <div class="stat-row"><span class="stat-key">Grass Area</span><span class="stat-val" id="statArea">0 px²</span></div>
-      <div class="stat-row"><span class="stat-key">Grass Height</span><span class="stat-val" id="statHeight">0 px</span></div>
+      <div class="stat-row"><span class="stat-key">Grass Area (frame)</span><span class="stat-val" id="statArea">0 px²</span></div>
+      <div class="stat-row"><span class="stat-key">Grass Area (ROI)</span><span class="stat-val" id="statRoiArea">0 px²</span></div>
+      <div class="stat-row"><span class="stat-key">ROI Coverage</span><span class="stat-val" id="statCoverage">0%</span></div>
       <div class="stat-row"><span class="stat-key">Instances</span><span class="stat-val" id="statInst">0</span></div>
     </div>
 
@@ -636,7 +777,20 @@ function updateUI(d) {
 
   // Stats
   document.getElementById("statArea").textContent   = `${(d.grass_area_px ?? 0).toLocaleString()} px²`;
-  document.getElementById("statHeight").textContent = `${d.grass_height_px ?? 0} px`;
+  document.getElementById("statRoiArea").textContent  = `${(d.roi_grass_px ?? 0).toLocaleString()} px²`;
+  document.getElementById("statCoverage").textContent = `${d.roi_coverage ?? 0}%`;
+
+  // Servo: fixed at center, pans nozzle toward hit point
+  const pan = (d.servo_pan ?? 0) * Math.PI / 180;
+  const hx  = 120 + Math.max(-1, Math.min(1, d.hit_pos ?? 0)) * 100;
+  const arm = document.getElementById("servoArm");
+  arm.setAttribute("x2", 120 + 26 * Math.sin(pan));
+  arm.setAttribute("y2", 14 + 26 * Math.cos(pan));
+  arm.setAttribute("stroke", d.pump_on ? "#0EA5E9" : "#A1A1AA");
+  const hw  = d.pump_on ? 6 + 20 * pct / 100 : 0;
+  document.getElementById("servoSpray").setAttribute("points", `120,14 ${hx - hw},80 ${hx + hw},80`);
+  document.getElementById("servoAngle").textContent = `${d.servo_angle ?? 90}°`;
+  document.getElementById("servoDir").textContent   = d.direction ?? "CENTER";
   document.getElementById("statInst").textContent   = d.n_detected ?? 0;
 }
 

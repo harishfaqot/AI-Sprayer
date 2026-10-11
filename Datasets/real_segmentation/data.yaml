@@ -1,0 +1,7 @@
+names:
+  0: Rumput Teki
+  1: Babandotan
+  2: Rumput Belulang
+path: Datasets/real_segmentation
+train: images/train
+val: images/val
