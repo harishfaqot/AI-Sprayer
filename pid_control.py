@@ -1,5 +1,5 @@
 """
-PID control for the AI Sprayer (software only, servos are simulated)
+PID control for the Prototype Sprayer Weeder (software only, servos are simulated)
 =====================================================================
 
 WHAT IS CONTROLLED

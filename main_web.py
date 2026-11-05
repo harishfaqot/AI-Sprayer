@@ -1,5 +1,5 @@
 """
-AI Sprayer - Web Dashboard
+Prototype Sprayer Weeder - Web Dashboard
 ==========================
 Open http://<YOUR_PC_IP>:5000 from any device on the same network.
 
@@ -22,17 +22,25 @@ import math
 import json
 import io
 import socket
-from flask import Flask, Response, render_template_string, request, jsonify
+import os
+import sys
+import glob
+from flask import Flask, Response, request, jsonify
 from pid_control import ControlSystem
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 # ── CONFIG ──────────────────────────────────────────────────────────────────
-MODEL_PATH   = r"runs/segment/train-9/weights/best.pt"
-SOURCE       = "video/real1.mp4"   # 0 = webcam, or "path/to/video.mp4"
+# Each value can be overridden per device with an environment variable (see deploy/sprayer-web.service)
+MODEL_PATH   = os.environ.get("SPRAYER_MODEL", r"runs/segment/train-9/weights/best.pt")
+SOURCE       = os.environ.get("SPRAYER_SOURCE", "video/real1.mp4")   # 0 = webcam, or "path/to/video.mp4"
 DEVICE       = "cpu"                # "cpu" or "cuda"
 REALTIME     = True                 # video file: skip frames to keep real-time speed
 PROCESS_WIDTH = 1280                # resize frames to this width (0 = keep original)
 CONF         = 0.4
-IMGSZ        = 640
+IMGSZ        = int(os.environ.get("SPRAYER_IMGSZ", 640))   # a .onnx model only works at the size it was exported with
 PORT         = 5000
 
 # ── Spray ROI (fractions of frame) ──
@@ -62,6 +70,7 @@ COL_BLUE     = (255, 166, 88)
 COL_GRAY     = (158, 148, 139)
 COL_YELLOW   = (0, 215, 255)
 COL_CYAN     = (255, 220, 0)
+COL_CLASS    = [(0, 140, 255), (200, 60, 220), (255, 140, 40)]   # Rumput Teki, Babandotan, Rumput Belulang
 # ────────────────────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
@@ -80,10 +89,11 @@ state = {
     "servo_pan":      0.0,     # deg, - left / + right
     "hit_pos":        0.0,     # spray hit point on ground, -1 (left) .. +1 (right) of ROI
     "servo_angle":    SERVO_CENTER,
-    "direction":      "CENTER",
+    "direction":      "TENGAH",
     "n_detected":     0,
     "detect_count":   0,
     "fps":            0,
+    "infer_ms":       0,       # AI time per frame (ms)
     "source":         str(SOURCE),
 }
 state_lock   = threading.Lock()
@@ -112,10 +122,10 @@ def load_model():
     global model
     try:
         from ultralytics import YOLO
-        model = YOLO(MODEL_PATH)
-        print(f"[AI Sprayer] Model loaded: {MODEL_PATH}")
+        model = YOLO(MODEL_PATH, task="segment")
+        print(f"[Sprayer Weeder] Model loaded: {MODEL_PATH}")
     except Exception as e:
-        print(f"[AI Sprayer] Model load error: {e}")
+        print(f"[Sprayer Weeder] Model load error: {e}")
 
 threading.Thread(target=load_model, daemon=True).start()
 
@@ -142,6 +152,60 @@ def grass_mask_from_result(result, shape):
     return mask
 
 
+def label_chip(frame, text, x, y, color, k=1.0):
+    """Readable label: white letters on a solid colour chip whose bottom edge sits at y.
+    (Thin coloured text on top of green plants is unreadable.)"""
+    fs, th, pad = 0.62 * k, max(1, int(round(1.7 * k))), int(5 * k)
+    (tw, tdh), base = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, fs, th)
+    h, w = frame.shape[:2]
+    x = max(0, min(int(x), w - tw - 2 * pad))
+    y = max(tdh + base + 2 * pad, min(int(y), h))
+    cv2.rectangle(frame, (x, y - tdh - base - 2 * pad), (x + tw + 2 * pad, y), color, -1)
+    cv2.putText(frame, text, (x + pad, y - pad - base), cv2.FONT_HERSHEY_SIMPLEX, fs, (255, 255, 255), th, cv2.LINE_AA)
+
+
+def draw_detections(frame, result):
+    """Weed masks + labels, one colour per species, drawn in place. Far cheaper than result.plot() on the Pi's CPU."""
+    k = frame.shape[1] / 1280
+    boxes = result.boxes
+    cls = [int(c) for c in boxes.cls.tolist()] if boxes is not None else []
+    color = lambda i: COL_CLASS[(cls[i] if i < len(cls) else 0) % len(COL_CLASS)]
+    if result.masks is not None:
+        layer, outlines = frame.copy(), []
+        for i, p in enumerate(result.masks.xy):
+            if len(p) >= 3:
+                poly = p.astype(np.int32)
+                cv2.fillPoly(layer, [poly], color(i))
+                outlines.append((poly, color(i)))
+        if outlines:
+            cv2.addWeighted(layer, 0.35, frame, 0.65, 0, dst=frame)
+            for poly, col in outlines:
+                cv2.polylines(frame, [poly], True, col, max(2, int(round(2 * k))), cv2.LINE_AA)
+    if boxes is not None:
+        for i, ((x1, y1, _, _), p) in enumerate(zip(boxes.xyxy.tolist(), boxes.conf.tolist())):
+            label_chip(frame, f"{result.names[cls[i]]} {p:.0%}", x1, y1, color(i), k)
+    return frame
+
+
+def system_stats():
+    """Board load shown on the dashboard: CPU %, RAM, temperature."""
+    out = {"cpu": None, "ram": None, "ram_used_mb": None, "ram_total_mb": None, "temp": None}
+    if psutil:
+        vm = psutil.virtual_memory()
+        out.update(cpu=psutil.cpu_percent(interval=0.2), ram=vm.percent,
+                   ram_used_mb=int(vm.used / 1048576), ram_total_mb=int(vm.total / 1048576))
+    temps = []
+    for f in glob.glob("/sys/class/thermal/thermal_zone*/temp"):
+        try:
+            with open(f) as fh:
+                temps.append(int(fh.read()) / 1000)
+        except (OSError, ValueError):
+            pass
+    if temps:
+        out["temp"] = round(max(temps), 1)
+    return out
+
+
 def _draw_overlay(frame, s, roi, roi_mask, centroid_x):
     h, w = frame.shape[:2]
     rx1, ry1, rx2, ry2 = roi
@@ -162,8 +226,7 @@ def _draw_overlay(frame, s, roi, roi_mask, centroid_x):
     t2 = max(2, int(round(2 * k)))
     roi_col = COL_GREEN if spraying else COL_YELLOW
     cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), roi_col, t2)
-    cv2.putText(frame, "SPRAY AREA", (rx1 + int(6 * k), ry2 - int(8 * k)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5 * k, roi_col, t1)
+    label_chip(frame, "AREA SEMPROT", rx1 + int(6 * k), ry2 - int(6 * k), (60, 70, 62), k)
 
     # Grass centroid (servo target)
     if centroid_x is not None:
@@ -194,57 +257,87 @@ def _draw_overlay(frame, s, roi, roi_mask, centroid_x):
     sw, sh = int(18 * k), int(12 * k)
     cv2.rectangle(frame, (px - sw, py - sh), (px + sw, py + sh), (40, 40, 40), -1)
     cv2.circle(frame, (px, py), int(6 * k), (255, 255, 255), -1)
-    cv2.putText(frame, f"{s['servo_angle']:.0f}deg", (px + sw + int(6 * k), py + int(5 * k)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5 * k, (255, 255, 255), t1)
+    # Pump / nozzle / servo / FPS numbers are shown as sharp text in the web page, not burned into the video.
 
-    # Top status bar
-    fs = 0.65 * k
-    ty = int(26 * k)
-    cv2.rectangle(frame, (0, 0), (w, int(38 * k)), (23, 17, 13), -1)
-    pump_txt  = "PUMP: ON" if spraying else "PUMP: OFF"
-    pump_col  = COL_GREEN if spraying else COL_RED
-    cv2.putText(frame, pump_txt, (int(10 * k), ty), cv2.FONT_HERSHEY_SIMPLEX, fs, pump_col, t2)
-    cv2.putText(frame, f"NOZZLE: {s['nozzle_pct']}%", (int(150 * k), ty), cv2.FONT_HERSHEY_SIMPLEX, fs, COL_BLUE, t2)
-    cv2.putText(frame, f"TARGET {s['nozzle_sp']}%  {s['servo_sp']:+.0f}deg", (int(640 * k), ty),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5 * k, COL_GRAY, t1)
-    cv2.putText(frame, f"SERVO: {s['servo_angle']:.0f}deg {s['direction']}", (int(330 * k), ty),
-                cv2.FONT_HERSHEY_SIMPLEX, fs, COL_CYAN, t2)
-    cv2.putText(frame, f"FPS: {s['fps']}", (w - int(105 * k), ty), cv2.FONT_HERSHEY_SIMPLEX, 0.55 * k, COL_GRAY, t1)
+class FrameGrabber:
+    """Reads the source in its own thread and keeps only the newest frame.
+    A video file is paced to real time, so decoding runs beside the AI instead of in front of it."""
+
+    def __init__(self, source_cap, realtime):
+        self.cap, self.frame, self.seq, self.ended = source_cap, None, 0, False
+        self._cv = threading.Condition()
+        self._stop = False
+        fps = source_cap.get(cv2.CAP_PROP_FPS) or 0
+        is_file = realtime and source_cap.get(cv2.CAP_PROP_FRAME_COUNT) > 0 and fps > 0
+        self._period = 1.0 / fps if is_file else 0
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        nxt = time.perf_counter()
+        while not self._stop:
+            ok, f = self.cap.read()
+            with self._cv:
+                if ok:
+                    self.frame, self.seq = f, self.seq + 1
+                else:
+                    self.ended = True
+                self._cv.notify_all()
+            if not ok:
+                return
+            if self._period:
+                nxt += self._period
+                wait = nxt - time.perf_counter()
+                if wait > 0:
+                    time.sleep(wait)
+                else:
+                    nxt = time.perf_counter()      # slower than real time: do not try to catch up
+
+    def next(self, last_seq, timeout=1.0):
+        """(frame, seq) of the newest frame after last_seq; (None, last_seq) on timeout;
+        (None, -1) once the source has ended."""
+        with self._cv:
+            if not self._cv.wait_for(lambda: self.seq > last_seq or self.ended, timeout):
+                return None, last_seq
+            if self.seq > last_seq:
+                return self.frame, self.seq
+            return None, -1
+
+    def stop(self):
+        self._stop = True
+        self._thread.join(timeout=2)
+
 
 def detection_loop():
-    global latest_frame, cap
+    global latest_frame
+    my_cap      = cap            # this session's capture (a new START may replace the global)
     frame_count = 0
     last_time   = time.time()
-
-    # Video file → skip frames so playback follows wall-clock time
-    src_fps   = cap.get(cv2.CAP_PROP_FPS) or 0
-    is_file   = REALTIME and cap.get(cv2.CAP_PROP_FRAME_COUNT) > 0 and src_fps > 0
-    start_t   = time.time()
-    frame_idx = 0
+    infer_ms    = 0.0
+    grabber     = FrameGrabber(my_cap, REALTIME)
+    last_seq    = 0
 
     while state["running"]:
-        if is_file:
-            target_idx = int((time.time() - start_t) * src_fps)
-            ok = True
-            while frame_idx < target_idx and ok:
-                ok = cap.grab()
-                frame_idx += 1
-        ret, frame = cap.read()
-        frame_idx += 1
-        if not ret:
+        frame, last_seq = grabber.next(last_seq)
+        if last_seq == -1:                      # source ended
             with state_lock:
                 state["running"] = False
             push_sse({"event": "stopped", "reason": "end_of_source"})
             break
+        if frame is None:                       # nothing new yet
+            continue
 
         if PROCESS_WIDTH and frame.shape[1] > PROCESS_WIDTH:
             scale = PROCESS_WIDTH / frame.shape[1]
             frame = cv2.resize(frame, (PROCESS_WIDTH, int(frame.shape[0] * scale)),
                                interpolation=cv2.INTER_AREA)
 
+        t_inf       = time.perf_counter()
         results     = model(frame, device=DEVICE, conf=CONF, imgsz=IMGSZ, verbose=False)
         result      = results[0]
-        annotated   = result.plot()
+        dt_ms       = (time.perf_counter() - t_inf) * 1000
+        infer_ms    = dt_ms if not infer_ms else 0.8 * infer_ms + 0.2 * dt_ms   # smoothed
+        annotated   = draw_detections(frame, result)
         n_detected  = len(result.boxes) if result.boxes is not None else 0
 
         # Grass inside spray ROI
@@ -282,7 +375,7 @@ def detection_loop():
         hit_pos     = math.tan(math.radians(servo_pan)) * NOZZLE_HEIGHT
         sign        = -1 if SERVO_INVERT else 1
         servo_angle = SERVO_CENTER + sign * servo_pan
-        direction   = "LEFT" if servo_pan < -DIR_DEADBAND else "RIGHT" if servo_pan > DIR_DEADBAND else "CENTER"
+        direction   = "KIRI" if servo_pan < -DIR_DEADBAND else "KANAN" if servo_pan > DIR_DEADBAND else "TENGAH"
 
         # FPS
         frame_count += 1
@@ -311,13 +404,14 @@ def detection_loop():
                 "direction":       direction,
                 "n_detected":      n_detected,
                 "fps":             fps,
+                "infer_ms":        round(infer_ms),
             })
             s = dict(state)
 
         _draw_overlay(annotated, s, roi, roi_mask, centroid_x)
 
         # Encode to JPEG
-        _, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 75])
+        _, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 88])
         with frame_lock:
             latest_frame = buf.tobytes()
 
@@ -325,7 +419,7 @@ def detection_loop():
         push_sse({k: s[k] for k in (
             "pump_on", "nozzle_pct", "nozzle_sp", "servo_sp", "grass_detected", "grass_area_px",
             "roi_grass_px", "roi_coverage", "servo_pan", "hit_pos", "servo_angle",
-            "direction", "n_detected", "detect_count", "fps")})
+            "direction", "n_detected", "detect_count", "fps", "infer_ms")})
 
         time.sleep(0.01)
 
@@ -333,16 +427,16 @@ def detection_loop():
     control.set_targets(0.0, 0.0)
     path = control.stop_log()
     if path:
-        print(f"[AI Sprayer] PID log saved: {path}")
-    if cap:
-        cap.release()
+        print(f"[Sprayer Weeder] PID log saved: {path}")
+    grabber.stop()
+    my_cap.release()
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.route("/")
 def index():
-    return render_template_string(HTML_PAGE)
+    return Response(render_page(), mimetype="text/html")
 
 
 @app.route("/video_feed")
@@ -385,21 +479,43 @@ def stats_stream():
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
+CAMERA_W   = int(os.environ.get("SPRAYER_CAM_W", 1280))
+CAMERA_H   = int(os.environ.get("SPRAYER_CAM_H", 720))
+CAMERA_FPS = int(os.environ.get("SPRAYER_CAM_FPS", 30))
+
+
+def open_source(src):
+    """A file or URL is opened as is. A camera number is opened as MJPG at 1280x720: the camera's own default
+    (often uncompressed 640x480) loads the CPU and the USB port much more."""
+    if not isinstance(src, int):
+        return cv2.VideoCapture(src)
+    cam = cv2.VideoCapture(src, cv2.CAP_V4L2) if sys.platform.startswith("linux") else cv2.VideoCapture(src)
+    if cam.isOpened():
+        cam.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cam.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_W)
+        cam.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_H)
+        cam.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
+        cam.set(cv2.CAP_PROP_BUFFERSIZE, 1)          # always the newest frame, no growing delay
+        print(f"[Sprayer Weeder] Camera {src}: {int(cam.get(cv2.CAP_PROP_FRAME_WIDTH))}x"
+              f"{int(cam.get(cv2.CAP_PROP_FRAME_HEIGHT))} @ {cam.get(cv2.CAP_PROP_FPS):.0f} fps")
+    return cam
+
+
 @app.route("/api/start", methods=["POST"])
 def api_start():
     global cap, _worker
     if state["running"]:
-        return jsonify({"ok": False, "msg": "Already running"})
+        return jsonify({"ok": False, "msg": "Sudah berjalan"})
     if model is None:
-        return jsonify({"ok": False, "msg": "Model not loaded yet"})
+        return jsonify({"ok": False, "msg": "Model AI belum selesai dimuat, tunggu sebentar"})
 
     data   = request.get_json(silent=True) or {}
     source = data.get("source", state["source"])
     src    = int(source) if str(source).isdigit() else source
 
-    cap = cv2.VideoCapture(src)
+    cap = open_source(src)
     if not cap.isOpened():
-        return jsonify({"ok": False, "msg": f"Cannot open source: {source}"})
+        return jsonify({"ok": False, "msg": f"Tidak bisa membuka sumber video: {source}"})
 
     with state_lock:
         state["running"]      = True
@@ -432,11 +548,11 @@ def api_pid():
     if request.method == "POST":
         d = request.get_json(silent=True) or {}
         if d.get("loop") not in ("servo", "nozzle"):
-            return jsonify({"ok": False, "msg": "loop must be 'servo' or 'nozzle'"})
+            return jsonify({"ok": False, "msg": "loop harus 'servo' atau 'nozzle'"})
         try:
             control.set_gains(d["loop"], d.get("kp"), d.get("ki"), d.get("kd"))
         except (TypeError, ValueError):
-            return jsonify({"ok": False, "msg": "invalid gain value"})
+            return jsonify({"ok": False, "msg": "Nilai gain tidak valid"})
     return jsonify({"ok": True, "gains": control.gains(), "metrics": control.metrics,
                     "mode": control.mode, "log": control.log_path, **control.snapshot()})
 
@@ -450,693 +566,31 @@ def api_pid_history():
 @app.route("/api/pid/step", methods=["POST"])
 def api_pid_step():
     ok = control.start_step_test()
-    return jsonify({"ok": ok, "msg": "" if ok else "Step test already running"})
+    return jsonify({"ok": ok, "msg": "" if ok else "Uji step sedang berjalan"})
+
+
+@app.route("/api/system")
+def api_system():
+    return jsonify(system_stats())
 
 
 # ── HTML Page ─────────────────────────────────────────────────────────────────
-HTML_PAGE = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>AI Sprayer — Dashboard</title>
-<style>
-  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Syne:wght@700;800&display=swap');
+PAGE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html")
 
-  :root {
-    --bg:       #FAFAFA;
-    --panel:    #FFFFFF;
-    --card:     #F4F4F5;
-    --border:   #E4E4E7;
-    --grn:      #16A34A;
-    --grn-dim:  #D1FAE5;
-    --red:      #DC2626;
-    --red-dim:  #FEE2E2;
-    --ylw:      #D97706;
-    --blu:      #2563EB;
-    --txt:      #18181B;
-    --muted:    #71717A;
-    --radius:   10px;
-  }
 
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+def render_page():
+    """dashboard.html with the few server-side values filled in (re-read on every request)."""
+    with open(PAGE_FILE, encoding="utf-8") as f:
+        return (f.read().replace("{{ source }}", str(SOURCE))
+                .replace("{{ servo_invert }}", "true" if SERVO_INVERT else "false")
+                .replace("{{ nozzle_height }}", str(NOZZLE_HEIGHT)))
 
-  body {
-    font-family: 'JetBrains Mono', monospace;
-    background: var(--bg);
-    color: var(--txt);
-    min-height: 100vh;
-    display: grid;
-    grid-template-rows: 56px 1fr;
-    grid-template-columns: 1fr;
-  }
 
-  /* ── Header ── */
-  header {
-    background: var(--panel);
-    border-bottom: 1px solid var(--border);
-    display: flex;
-    align-items: center;
-    padding: 0 20px;
-    gap: 12px;
-    position: sticky; top: 0; z-index: 10;
-  }
-  .logo {
-    font-family: 'Syne', sans-serif;
-    font-size: 1.1rem; font-weight: 800;
-    color: var(--grn);
-    letter-spacing: -0.02em;
-  }
-  .logo span { color: var(--muted); font-weight: 700; }
-  .badge {
-    font-size: 0.6rem; font-weight: 600;
-    padding: 2px 8px; border-radius: 999px;
-    background: var(--grn-dim); color: var(--grn);
-    letter-spacing: 0.08em; text-transform: uppercase;
-  }
-  .badge.off { background: var(--red-dim); color: var(--red); }
-  .hdr-right { margin-left: auto; display: flex; gap: 8px; align-items: center; }
-  .fps-badge {
-    font-size: 0.65rem; color: var(--muted);
-    border: 1px solid var(--border); padding: 3px 10px; border-radius: 6px;
-  }
-
-  /* ── Main layout ── */
-  main {
-    display: grid;
-    grid-template-columns: 1fr 300px;
-    gap: 16px;
-    padding: 16px;
-    align-items: start;
-  }
-  @media (max-width: 900px) {
-    main { grid-template-columns: 1fr; }
-  }
-
-  /* ── Video panel ── */
-  .video-wrap {
-    background: #000;
-    border-radius: var(--radius);
-    overflow: hidden;
-    position: relative;
-    aspect-ratio: 16/9;
-    border: 1px solid var(--border);
-  }
-  .video-wrap img {
-    width: 100%; height: 100%;
-    object-fit: cover;
-    display: block;
-  }
-  .video-placeholder {
-    position: absolute; inset: 0;
-    display: flex; flex-direction: column;
-    align-items: center; justify-content: center;
-    color: var(--muted); gap: 8px;
-    font-size: 0.8rem;
-  }
-  .video-placeholder .icon { font-size: 2.5rem; opacity: 0.3; }
-
-  /* Source bar */
-  .src-bar {
-    display: flex; gap: 8px; margin-top: 10px; align-items: center;
-  }
-  .src-bar label { font-size: 0.65rem; color: var(--muted); white-space: nowrap; }
-  .src-bar input {
-    flex: 1; font-family: inherit; font-size: 0.75rem;
-    padding: 6px 10px; border: 1px solid var(--border);
-    border-radius: 6px; background: var(--card); color: var(--txt);
-    outline: none;
-  }
-  .src-bar input:focus { border-color: var(--grn); }
-
-  /* Buttons */
-  .btn {
-    font-family: inherit; font-size: 0.7rem; font-weight: 700;
-    padding: 6px 14px; border-radius: 6px; border: none; cursor: pointer;
-    letter-spacing: 0.04em; transition: opacity 0.15s, transform 0.1s;
-    white-space: nowrap;
-  }
-  .btn:active { transform: scale(0.97); }
-  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
-  .btn-grn { background: var(--grn); color: #fff; }
-  .btn-red { background: var(--red); color: #fff; }
-
-  /* ── Right panel ── */
-  .right-panel { display: flex; flex-direction: column; gap: 12px; }
-
-  .card {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 14px;
-  }
-  .card-title {
-    font-size: 0.6rem; font-weight: 700; color: var(--muted);
-    letter-spacing: 0.1em; text-transform: uppercase; margin-bottom: 10px;
-  }
-
-  /* Status indicator */
-  .status-row { display: flex; align-items: center; gap: 8px; }
-  .dot {
-    width: 10px; height: 10px; border-radius: 50%;
-    background: var(--muted); flex-shrink: 0;
-    transition: background 0.3s;
-  }
-  .dot.on { background: var(--grn); box-shadow: 0 0 0 3px var(--grn-dim); }
-  .status-text { font-size: 0.85rem; font-weight: 700; color: var(--muted); }
-  .status-text.on { color: var(--grn); }
-  .detect-count { font-size: 0.65rem; color: var(--muted); margin-top: 6px; }
-
-  /* Pump */
-  .pump-box {
-    border-radius: 7px; padding: 14px 10px;
-    text-align: center; font-size: 1rem; font-weight: 700;
-    letter-spacing: 0.08em; transition: background 0.3s, color 0.3s;
-    background: var(--red-dim); color: var(--red);
-  }
-  .pump-box.on { background: var(--grn-dim); color: var(--grn); }
-
-  /* Gauge */
-  .gauge-wrap { text-align: center; }
-  svg.gauge { display: block; margin: 0 auto; }
-  .nozzle-pct { font-size: 1.6rem; font-weight: 700; margin-top: 2px; }
-  .progress-track {
-    height: 7px; background: var(--border); border-radius: 99px;
-    overflow: hidden; margin-top: 8px;
-  }
-  .progress-fill {
-    height: 100%; width: 0%; border-radius: 99px;
-    background: var(--grn); transition: width 0.2s, background 0.2s;
-  }
-
-  /* Stats */
-  .stat-row {
-    display: flex; justify-content: space-between; align-items: baseline;
-    padding: 4px 0; border-bottom: 1px solid var(--border);
-    font-size: 0.72rem;
-  }
-  .stat-row:last-child { border-bottom: none; }
-  .stat-key { color: var(--muted); }
-  .stat-val { font-weight: 700; }
-
-  /* Log */
-  .log-box {
-    background: var(--card); border-radius: 6px;
-    padding: 8px; font-size: 0.65rem; color: var(--grn);
-    height: 110px; overflow-y: auto; line-height: 1.6;
-  }
-  .log-box .log-line { color: var(--muted); }
-  .log-box .log-line span { color: var(--txt); }
-
-  /* PID panel */
-  .pid-card { margin-top: 12px; }
-  .pid-charts { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-  @media (max-width: 700px) { .pid-charts { grid-template-columns: 1fr; } }
-  .pid-chart canvas { width: 100%; height: 150px; display: block;
-                      background: var(--card); border-radius: 6px; }
-  .pid-chart-hdr { display: flex; justify-content: space-between; align-items: baseline;
-                   font-size: 0.65rem; color: var(--muted); margin-bottom: 4px; }
-  .pid-chart-hdr b { color: var(--txt); }
-  .legend i { display: inline-block; width: 14px; height: 2px; vertical-align: middle; margin: 0 3px 0 8px; }
-  .gains { display: flex; gap: 6px; margin-top: 8px; align-items: center; flex-wrap: wrap; }
-  .gains label { font-size: 0.6rem; color: var(--muted); }
-  .gains input { width: 66px; font-family: inherit; font-size: 0.7rem; padding: 4px 6px;
-                 border: 1px solid var(--border); border-radius: 5px; background: var(--card); color: var(--txt); }
-  .btn-gry { background: var(--txt); color: #fff; }
-  .metrics { width: 100%; border-collapse: collapse; font-size: 0.65rem; margin-top: 8px; }
-  .metrics th, .metrics td { padding: 3px 4px; text-align: right; border-bottom: 1px solid var(--border); }
-  .metrics th { color: var(--muted); font-weight: 600; }
-  .metrics td:first-child, .metrics th:first-child { text-align: left; }
-  .pid-actions { display: flex; gap: 8px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
-  .pid-note { font-size: 0.62rem; color: var(--muted); }
-  .help { font-size: 0.68rem; color: var(--muted); line-height: 1.6; margin-bottom: 10px; }
-  .help b { color: var(--txt); }
-  .help ul { margin: 4px 0 0 16px; }
-  details.help summary { cursor: pointer; color: var(--blu); font-weight: 600; }
-  .vlegend { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 10px;
-             font-size: 0.65rem; color: var(--muted); }
-  .vlegend span { display: inline-flex; align-items: center; gap: 5px; }
-  .sw { width: 14px; height: 10px; border-radius: 2px; display: inline-block; }
-  .sw.line { height: 3px; }
-
-  /* Pulse animation for dot */
-  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
-  .dot.on { animation: pulse 1.5s infinite; }
-</style>
-</head>
-<body>
-
-<header>
-  <div class="logo">⬡ AI SPRAYER <span>/ WEB</span></div>
-  <div id="runBadge" class="badge off">STOPPED</div>
-  <div class="hdr-right">
-    <div class="fps-badge" id="fpsBadge">FPS: --</div>
-  </div>
-</header>
-
-<main>
-  <!-- LEFT: video -->
-  <div>
-    <div class="video-wrap" id="videoWrap">
-      <div class="video-placeholder" id="videoPlaceholder">
-        <div class="icon">📷</div>
-        <div>Press START to begin detection</div>
-      </div>
-      <img id="videoImg" src="" alt="stream" style="display:none"
-           onerror="this.style.display='none'; document.getElementById('videoPlaceholder').style.display='flex'">
-    </div>
-    <div class="src-bar">
-      <label>SOURCE</label>
-      <input type="text" id="srcInput" value="{{ source }}" placeholder="0 = webcam | path/to/video.mp4">
-      <button class="btn btn-grn" id="btnStart" onclick="startStream()">▶ START</button>
-      <button class="btn btn-red" id="btnStop" onclick="stopStream()" disabled>■ STOP</button>
-    </div>
-
-    <!-- Video legend -->
-    <div class="vlegend">
-      <span><i class="sw" style="border:2px solid #FFD700"></i>Spray area (waiting)</span>
-      <span><i class="sw" style="border:2px solid #53D339"></i>Spray area (spraying)</span>
-      <span><i class="sw" style="background:#F85149;opacity:.6"></i>Grass inside spray area</span>
-      <span><b style="color:#F85149">+</b>Grass center (where to aim)</span>
-      <span><i class="sw line" style="background:#F85149"></i>Target angle</span>
-      <span><i class="sw line" style="background:#00DCFF;height:5px"></i>Actual nozzle angle</span>
-      <span><i class="sw" style="background:#00DCFF;opacity:.4"></i>Spray</span>
-    </div>
-
-    <!-- PID response -->
-    <div class="card pid-card">
-      <div class="card-title">▸ PID Control <span id="pidMode" style="float:right"></span></div>
-
-      <details class="help">
-        <summary>What is this? (click to read)</summary>
-        <p style="margin-top:6px">The camera decides a <b>target</b> for two servos:
-          the <b>angle servo</b> (aims the nozzle left/right at the grass) and the
-          <b>nozzle servo</b> (opens the nozzle more when there is more grass).
-          The target changes every frame and can jump. The <b>PID controller</b> moves each servo
-          toward its target smoothly: fast when far, slowing down when close, without
-          overshooting or shaking. It runs 200 times per second, in software only.</p>
-        <ul>
-          <li><b>Kp</b> (push): higher = reacts faster. Too high = overshoots / shakes.</li>
-          <li><b>Ki</b> (fix leftover error): keep small. Too high = overshoots and goes slow to settle.</li>
-          <li><b>Kd</b> (brake): higher = less overshoot. Too high = sluggish / jittery.</li>
-        </ul>
-        <p style="margin-top:4px"><b>STEP TEST</b> sends fixed targets (angle 0 → +30° → −30° → 0,
-          nozzle 0 → 80% → 30% → 0) to measure how good the tuning is.
-          Servos are simulated for now (no hardware connected).</p>
-      </details>
-
-      <div class="pid-charts">
-        <div class="pid-chart">
-          <div class="pid-chart-hdr">
-            <span><b>Angle servo</b> (degree, − left / + right)</span>
-            <span class="legend"><i style="background:#DC2626"></i>Target<i style="background:#2563EB"></i>Actual</span>
-          </div>
-          <canvas id="chartServo"></canvas>
-          <div class="gains">
-            <label title="Push: bigger = faster">Kp</label><input id="servo_kp" type="number" step="any">
-            <label title="Fix leftover error: keep small">Ki</label><input id="servo_ki" type="number" step="any">
-            <label title="Brake: bigger = less overshoot">Kd</label><input id="servo_kd" type="number" step="any">
-            <button class="btn btn-gry" onclick="applyGains('servo')">APPLY</button>
-          </div>
-        </div>
-        <div class="pid-chart">
-          <div class="pid-chart-hdr">
-            <span><b>Nozzle servo</b> (opening %)</span>
-            <span class="legend"><i style="background:#DC2626"></i>Target<i style="background:#2563EB"></i>Actual</span>
-          </div>
-          <canvas id="chartNozzle"></canvas>
-          <div class="gains">
-            <label title="Push: bigger = faster">Kp</label><input id="nozzle_kp" type="number" step="any">
-            <label title="Fix leftover error: keep small">Ki</label><input id="nozzle_ki" type="number" step="any">
-            <label title="Brake: bigger = less overshoot">Kd</label><input id="nozzle_kd" type="number" step="any">
-            <button class="btn btn-gry" onclick="applyGains('nozzle')">APPLY</button>
-          </div>
-        </div>
-      </div>
-      <div class="pid-note" style="margin-top:6px">Good tuning: the blue line follows the red dashed line quickly, without going past it.</div>
-      <div class="pid-actions">
-        <button class="btn btn-grn" id="btnStep" onclick="stepTest()">STEP TEST</button>
-        <span class="pid-note" id="pidLog">CSV log: —</span>
-      </div>
-      <div class="help" id="metricsHelp" hidden style="margin:8px 0 0">
-        <b>Rise</b> = time to get from 10% to 90% of the way (smaller = faster) ·
-        <b>Overshoot</b> = how far it went past the target (smaller = better) ·
-        <b>Settling</b> = time until it stays at the target ±2% (smaller = better) ·
-        <b>Error</b> = what is left at the end (closer to 0 = better)
-      </div>
-      <table class="metrics" id="metricsTable" hidden>
-        <thead><tr><th>Servo</th><th>Target change</th><th>Rise (s)</th><th>Overshoot</th><th>Settling (s)</th><th>Error</th></tr></thead>
-        <tbody></tbody>
-      </table>
-    </div>
-  </div>
-
-  <!-- RIGHT: control panel -->
-  <div class="right-panel">
-
-    <!-- Status -->
-    <div class="card">
-      <div class="card-title">▸ Detection Status</div>
-      <div class="status-row">
-        <div class="dot" id="statusDot"></div>
-        <div class="status-text" id="statusText">NO GRASS</div>
-      </div>
-      <div class="detect-count" id="detectCount">Detections: 0</div>
-    </div>
-
-    <!-- Pump -->
-    <div class="card">
-      <div class="card-title">▸ Pump Control</div>
-      <div class="pump-box" id="pumpBox">PUMP  OFF</div>
-    </div>
-
-    <!-- Nozzle -->
-    <div class="card">
-      <div class="card-title">▸ Nozzle Opening</div>
-      <div class="gauge-wrap">
-        <svg class="gauge" width="180" height="100" viewBox="0 0 180 100">
-          <!-- track -->
-          <path d="M 14 90 A 76 76 0 0 1 166 90" fill="none" stroke="#E4E4E7" stroke-width="10" stroke-linecap="round"/>
-          <!-- fill -->
-          <path id="gaugeFill" d="M 14 90 A 76 76 0 0 1 166 90" fill="none" stroke="#16A34A" stroke-width="10" stroke-linecap="round"
-                stroke-dasharray="238.76" stroke-dashoffset="238.76" style="transition: stroke-dashoffset 0.2s, stroke 0.2s"/>
-          <!-- needle -->
-          <line id="gaugeNeedle" x1="90" y1="90" x2="90" y2="22" stroke="#18181B" stroke-width="2" stroke-linecap="round"
-                style="transform-origin:90px 90px; transform:rotate(-90deg); transition:transform 0.2s"/>
-          <circle cx="90" cy="90" r="4" fill="#18181B"/>
-          <!-- labels -->
-          <text x="10" y="100" font-family="JetBrains Mono" font-size="9" fill="#71717A">0</text>
-          <text x="155" y="100" font-family="JetBrains Mono" font-size="9" fill="#71717A">100</text>
-        </svg>
-        <div class="nozzle-pct" id="nozzlePct">0%</div>
-        <div class="detect-count" id="nozzleSp">Target: 0%</div>
-        <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
-      </div>
-    </div>
-
-    <!-- Servo -->
-    <div class="card">
-      <div class="card-title">▸ Angle Servo</div>
-      <svg width="100%" height="90" viewBox="0 0 240 90">
-        <!-- ground / ROI width -->
-        <line x1="20" y1="80" x2="220" y2="80" stroke="#E4E4E7" stroke-width="6" stroke-linecap="round"/>
-        <line x1="120" y1="74" x2="120" y2="86" stroke="#A1A1AA" stroke-width="1"/>
-        <polygon id="servoSpray" points="120,14 120,80 120,80" fill="#0EA5E9" opacity="0.3"/>
-        <!-- servo body + arm -->
-        <line id="servoArm" x1="120" y1="14" x2="120" y2="40" stroke="#A1A1AA" stroke-width="5" stroke-linecap="round"/>
-        <rect x="108" y="6" width="24" height="16" rx="3" fill="#27272A"/>
-        <circle cx="120" cy="14" r="3" fill="#fff"/>
-        <text x="8" y="84" font-family="JetBrains Mono" font-size="9" fill="#71717A">L</text>
-        <text x="226" y="84" font-family="JetBrains Mono" font-size="9" fill="#71717A">R</text>
-      </svg>
-      <div class="stat-row"><span class="stat-key">Actual angle</span><span class="stat-val" id="servoAngle">90°</span></div>
-      <div class="stat-row"><span class="stat-key">Target</span><span class="stat-val" id="servoSp">0°</span></div>
-      <div class="stat-row"><span class="stat-key">Direction</span><span class="stat-val" id="servoDir">CENTER</span></div>
-    </div>
-
-    <!-- Stats -->
-    <div class="card">
-      <div class="card-title">▸ Measurements</div>
-      <div class="stat-row"><span class="stat-key">Grass Area (frame)</span><span class="stat-val" id="statArea">0 px²</span></div>
-      <div class="stat-row"><span class="stat-key">Grass Area (ROI)</span><span class="stat-val" id="statRoiArea">0 px²</span></div>
-      <div class="stat-row"><span class="stat-key">ROI Coverage</span><span class="stat-val" id="statCoverage">0%</span></div>
-      <div class="stat-row"><span class="stat-key">Instances</span><span class="stat-val" id="statInst">0</span></div>
-    </div>
-
-    <!-- Log -->
-    <div class="card" style="flex:1">
-      <div class="card-title">▸ System Log</div>
-      <div class="log-box" id="logBox"></div>
-    </div>
-
-  </div>
-</main>
-
-<script>
-// ── SSE ──────────────────────────────────────────────────────────────────────
-const GAUGE_LEN = 238.76;
-let es = null;
-
-function connectSSE() {
-  if (es) es.close();
-  es = new EventSource("/stats_stream");
-  es.onmessage = (e) => {
-    const d = JSON.parse(e.data);
-    if (d.event === "stopped") {
-      onStopped(d.reason);
-      return;
-    }
-    if (d.event === "started") { return; }
-    updateUI(d);
-  };
-  es.onerror = () => {
-    setTimeout(connectSSE, 3000);
-  };
-}
-
-function updateUI(d) {
-  // FPS
-  document.getElementById("fpsBadge").textContent = `FPS: ${d.fps ?? "--"}`;
-
-  // Status dot
-  const dot  = document.getElementById("statusDot");
-  const stxt = document.getElementById("statusText");
-  if (d.grass_detected) {
-    dot.className = "dot on";
-    stxt.className = "status-text on";
-    stxt.textContent = "GRASS DETECTED";
-  } else {
-    dot.className = "dot";
-    stxt.className = "status-text";
-    stxt.textContent = "NO GRASS";
-  }
-  document.getElementById("detectCount").textContent = `Detections: ${d.detect_count ?? 0}`;
-
-  // Pump
-  const pump = document.getElementById("pumpBox");
-  pump.className = "pump-box" + (d.pump_on ? " on" : "");
-  pump.textContent = d.pump_on ? "PUMP  ON" : "PUMP  OFF";
-
-  // Stats
-  document.getElementById("statArea").textContent   = `${(d.grass_area_px ?? 0).toLocaleString()} px²`;
-  document.getElementById("statRoiArea").textContent  = `${(d.roi_grass_px ?? 0).toLocaleString()} px²`;
-  document.getElementById("statCoverage").textContent = `${d.roi_coverage ?? 0}%`;
-
-  lastPump = !!d.pump_on;
-  document.getElementById("servoDir").textContent   = d.direction ?? "CENTER";
-  document.getElementById("statInst").textContent   = d.n_detected ?? 0;
-}
-
-// ── Actuators (PID PV) ────────────────────────────────────────────────────────
-const SERVO_INVERT = {{ servo_invert }};
-const NOZZLE_HEIGHT = {{ nozzle_height }};
-let lastPump = false;
-
-function updateActuators(p) {
-  // Nozzle gauge = actual opening
-  const pct = Math.round(p.nozzle_pv);
-  const fill = document.getElementById("gaugeFill");
-  fill.setAttribute("stroke-dashoffset", GAUGE_LEN * (1 - pct / 100));
-  fill.setAttribute("stroke", pct < 60 ? "#16A34A" : pct < 85 ? "#D97706" : "#DC2626");
-  document.getElementById("gaugeNeedle").style.transform = `rotate(${-90 + pct * 1.8}deg)`;
-  document.getElementById("nozzlePct").textContent = `${pct}%`;
-  document.getElementById("nozzleSp").textContent  = `Target: ${Math.round(p.nozzle_sp)}%`;
-  const pf = document.getElementById("progressFill");
-  pf.style.width = `${pct}%`;
-  pf.style.background = pct < 60 ? "var(--grn)" : pct < 85 ? "var(--ylw)" : "var(--red)";
-
-  // Servo = actual pan angle
-  const pan = p.servo_pv * Math.PI / 180;
-  const hit = Math.max(-1, Math.min(1, Math.tan(pan) * NOZZLE_HEIGHT));
-  const hx  = 120 + hit * 100;
-  const arm = document.getElementById("servoArm");
-  const spraying = (lastPump || p.mode === "step") && pct > 1;
-  arm.setAttribute("x2", 120 + 26 * Math.sin(pan));
-  arm.setAttribute("y2", 14 + 26 * Math.cos(pan));
-  arm.setAttribute("stroke", spraying ? "#0EA5E9" : "#A1A1AA");
-  const hw  = spraying ? 6 + 20 * pct / 100 : 0;
-  document.getElementById("servoSpray").setAttribute("points", `120,14 ${hx - hw},80 ${hx + hw},80`);
-  const ang = 90 + (SERVO_INVERT ? -1 : 1) * p.servo_pv;
-  document.getElementById("servoAngle").textContent = `${ang.toFixed(1)}°`;
-  document.getElementById("servoSp").textContent    = `${p.servo_sp >= 0 ? "+" : ""}${p.servo_sp.toFixed(1)}° pan`;
-}
-
-// ── PID charts ────────────────────────────────────────────────────────────────
-const WINDOW_S = 10;
-let pidHist = [], pidSince = -1, pidNow = 0, lastMode = "vision";
-
-function drawChart(id, iSp, iPv, iU, yMin, yMax, uMin) {
-  const cv = document.getElementById(id);
-  const dpr = window.devicePixelRatio || 1;
-  const W = cv.clientWidth, H = cv.clientHeight;
-  if (cv.width !== W * dpr) { cv.width = W * dpr; cv.height = H * dpr; }
-  const g = cv.getContext("2d");
-  g.setTransform(dpr, 0, 0, dpr, 0, 0);
-  g.clearRect(0, 0, W, H);
-  const L = 30, R = 6, T = 6, B = 16;
-  const t0 = pidNow - WINDOW_S;
-  const X = t => L + (t - t0) / WINDOW_S * (W - L - R);
-  const Y = v => T + (1 - (v - yMin) / (yMax - yMin)) * (H - T - B);
-  const YU = u => T + (1 - (u - uMin) / (1 - uMin)) * (H - T - B);
-
-  g.font = "9px JetBrains Mono, monospace"; g.fillStyle = "#71717A"; g.strokeStyle = "#E4E4E7"; g.lineWidth = 1;
-  for (let k = 0; k <= 4; k++) {
-    const v = yMin + (yMax - yMin) * k / 4, y = Y(v);
-    g.beginPath(); g.moveTo(L, y); g.lineTo(W - R, y); g.stroke();
-    g.fillText(Math.round(v), 2, y + 3);
-  }
-  for (let s = 0; s <= WINDOW_S; s += 2) g.fillText(`-${WINDOW_S - s}s`, X(t0 + s) - 8, H - 3);
-
-  const pts = pidHist.filter(h => h[0] >= t0);
-  const line = (fn, col, w, dash) => {
-    g.strokeStyle = col; g.lineWidth = w; g.setLineDash(dash || []); g.beginPath();
-    pts.forEach((h, k) => { const x = X(h[0]), y = fn(h); k ? g.lineTo(x, y) : g.moveTo(x, y); });
-    g.stroke(); g.setLineDash([]);
-  };
-  line(h => Y(h[iSp]), "#DC2626", 1.5, [4, 3]);
-  line(h => Y(h[iPv]), "#2563EB", 2);
-}
-
-async function pollPid() {
-  try {
-    const r = await fetch(`/api/pid/history?since=${pidSince}`);
-    const d = await r.json();
-    if (d.samples.length) {
-      if (d.samples[0][0] < pidSince) pidHist = [];
-      pidHist.push(...d.samples);
-      pidSince = d.samples[d.samples.length - 1][0];
-      pidHist = pidHist.filter(h => h[0] >= pidSince - WINDOW_S - 1);
-    }
-    pidNow = d.now;
-    drawChart("chartServo",  1, 2, 3, -60, 60, -1);
-    drawChart("chartNozzle", 4, 5, 6,   0, 100, -1);
-
-    const p = await (await fetch("/api/pid")).json();
-    updateActuators(p);
-    document.getElementById("pidMode").textContent = p.mode === "step" ? "STEP TEST…" : "";
-    document.getElementById("btnStep").disabled = p.mode === "step";
-    if (p.log) document.getElementById("pidLog").textContent = `CSV log: ${p.log}`;
-    if (lastMode === "step" && p.mode !== "step") { showMetrics(p.metrics); log("Step test done."); }
-    lastMode = p.mode;
-  } catch (e) {}
-  setTimeout(pollPid, 200);
-}
-
-function fillGains(g) {
-  for (const loop of ["servo", "nozzle"])
-    for (const k of ["kp", "ki", "kd"])
-      document.getElementById(`${loop}_${k}`).value = g[loop][k];
-}
-
-async function applyGains(loop) {
-  const v = k => parseFloat(document.getElementById(`${loop}_${k}`).value);
-  const body = {loop, kp: v("kp"), ki: v("ki"), kd: v("kd")};
-  const d = await (await fetch("/api/pid", {method: "POST",
-    headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)})).json();
-  if (d.ok) { fillGains(d.gains); log(`${loop} gains → Kp=${body.kp} Ki=${body.ki} Kd=${body.kd}`); }
-  else log(`ERROR: ${d.msg}`);
-}
-
-async function stepTest() {
-  const d = await (await fetch("/api/pid/step", {method: "POST"})).json();
-  log(d.ok ? "Step test started." : `ERROR: ${d.msg}`);
-}
-
-function showMetrics(m) {
-  const tb = document.querySelector("#metricsTable tbody");
-  tb.innerHTML = "";
-  for (const loop of ["servo", "nozzle"]) {
-    const unit = loop === "servo" ? "°" : "%";
-    for (const r of (m[loop] || [])) {
-      tb.innerHTML += `<tr><td>${loop === "servo" ? "Angle" : "Nozzle"}</td><td>${r.from}→${r.to}${unit}</td>` +
-        `<td>${r.rise_time ?? "—"}</td><td>${r.overshoot_pct}%</td>` +
-        `<td>${r.settling_time}</td><td>${r.sse}${unit}</td></tr>`;
-    }
-  }
-  document.getElementById("metricsTable").hidden = false;
-  document.getElementById("metricsHelp").hidden  = false;
-  if (m.log) document.getElementById("pidLog").textContent = `CSV log: ${m.log}`;
-}
-
-// ── Controls ──────────────────────────────────────────────────────────────────
-function log(msg) {
-  const box = document.getElementById("logBox");
-  const ts  = new Date().toLocaleTimeString();
-  box.innerHTML += `<div class="log-line">[${ts}] <span>${msg}</span></div>`;
-  box.scrollTop = box.scrollHeight;
-}
-
-async function startStream() {
-  const src = document.getElementById("srcInput").value.trim();
-  log(`Starting → ${src}`);
-  const res = await fetch("/api/start", {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({source: src})
-  });
-  const data = await res.json();
-  if (data.ok) {
-    document.getElementById("btnStart").disabled = true;
-    document.getElementById("btnStop").disabled  = false;
-    document.getElementById("runBadge").textContent = "RUNNING";
-    document.getElementById("runBadge").className   = "badge";
-    // Show video
-    const img = document.getElementById("videoImg");
-    img.src = `/video_feed?t=${Date.now()}`;
-    img.style.display = "block";
-    document.getElementById("videoPlaceholder").style.display = "none";
-    log("Stream started.");
-  } else {
-    log(`ERROR: ${data.msg}`);
-  }
-}
-
-async function stopStream() {
-  await fetch("/api/stop", {method: "POST"});
-  onStopped("user");
-}
-
-function onStopped(reason) {
-  document.getElementById("btnStart").disabled = false;
-  document.getElementById("btnStop").disabled  = true;
-  document.getElementById("runBadge").textContent = "STOPPED";
-  document.getElementById("runBadge").className   = "badge off";
-  document.getElementById("videoImg").style.display = "none";
-  document.getElementById("videoPlaceholder").style.display = "flex";
-  log(`Stopped. Reason: ${reason ?? "unknown"}`);
-}
-
-// ── Init ──────────────────────────────────────────────────────────────────────
-connectSSE();
-log("Dashboard connected.");
-
-// Restore running state on page reload
-fetch("/api/state").then(r => r.json()).then(d => {
-  if (d.running) {
-    document.getElementById("btnStart").disabled = true;
-    document.getElementById("btnStop").disabled  = false;
-    document.getElementById("runBadge").textContent = "RUNNING";
-    document.getElementById("runBadge").className   = "badge";
-    const img = document.getElementById("videoImg");
-    img.src = `/video_feed?t=${Date.now()}`;
-    img.style.display = "block";
-    document.getElementById("videoPlaceholder").style.display = "none";
-    log("Reconnected to active session.");
-  }
-  updateUI(d);
-});
-
-fetch("/api/pid").then(r => r.json()).then(p => {
-  fillGains(p.gains);
-  if (p.metrics && p.metrics.servo) showMetrics(p.metrics);
-});
-pollPid();
-</script>
-</body>
-</html>
-""".replace("{{ source }}", str(SOURCE)) \
- .replace("{{ servo_invert }}", "true" if SERVO_INVERT else "false") \
- .replace("{{ nozzle_height }}", str(NOZZLE_HEIGHT))
+@app.route("/api/sources")
+def api_sources():
+    """Video files the user can pick in the dashboard (0 = camera)."""
+    files = {p.replace("\\", "/") for ext in ("mp4", "MP4", "avi") for p in glob.glob(f"video/*.{ext}")}
+    return jsonify(["0"] + sorted(files))
 
 
 # ── Run ────────────────────────────────────────────────────────────────────────
@@ -1151,7 +605,7 @@ if __name__ == "__main__":
         local_ip = "127.0.0.1"
 
     print("=" * 50)
-    print(f"  AI Sprayer Web Dashboard")
+    print(f"  Prototype Sprayer Weeder - Web Dashboard")
     print(f"  Local:   http://localhost:{PORT}")
     print(f"  Network: http://{local_ip}:{PORT}")
     print("=" * 50)

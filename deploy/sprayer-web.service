@@ -1,0 +1,20 @@
+[Unit]
+Description=Prototype Sprayer Weeder web dashboard (starts at boot)
+After=NetworkManager.service
+
+[Service]
+User=orangepi
+WorkingDirectory=/home/orangepi/sprayer-weeder
+# memakai Python + paket yang sudah terpasang di venv lama
+ExecStart=/home/orangepi/AI-Sprayer/venv/bin/python main_web.py
+Environment=PYTHONUNBUFFERED=1
+# model ONNX 416 px: ~2x lebih cepat dari .pt 640 px di CPU Orange Pi (lihat README, bagian Kecepatan)
+Environment=SPRAYER_MODEL=runs/segment/train-9/weights/best_416.onnx
+Environment=SPRAYER_IMGSZ=416
+# video 720p: dekode video 1440p asli terlalu berat untuk CPU Orange Pi
+Environment=SPRAYER_SOURCE=video/real1_720p.mp4
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

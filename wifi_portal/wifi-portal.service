@@ -1,0 +1,16 @@
+[Unit]
+Description=WiFi manager: hotspot + captive portal when no WiFi
+After=NetworkManager.service
+Wants=NetworkManager.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/python3 /opt/wifi-portal/wifi_portal.py
+Restart=always
+RestartSec=3
+# main loop sends a heartbeat every 15 s; if it hangs, systemd restarts the service
+WatchdogSec=180
+
+[Install]
+WantedBy=multi-user.target

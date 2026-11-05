@@ -1,0 +1,14 @@
+[Unit]
+Description=Forward port 80 to the AI Sprayer web app (port 5000), except the setup hotspot address
+After=network-pre.target NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# 10.42.0.1 = hotspot address (ap_ip in /etc/wifi-portal.json): the setup portal keeps its own port 80
+ExecStart=/bin/sh -c 'for r in "PREROUTING -i wlan0" "PREROUTING -i eth0" "OUTPUT -o lo"; do iptables -t nat -C $r ! -d 10.42.0.1 -p tcp --dport 80 -j REDIRECT --to-ports 5000 2>/dev/null || iptables -t nat -A $r ! -d 10.42.0.1 -p tcp --dport 80 -j REDIRECT --to-ports 5000; done'
+ExecStop=/bin/sh -c 'for r in "PREROUTING -i wlan0" "PREROUTING -i eth0" "OUTPUT -o lo"; do iptables -t nat -D $r ! -d 10.42.0.1 -p tcp --dport 80 -j REDIRECT --to-ports 5000 2>/dev/null; done; true'
+
+[Install]
+WantedBy=multi-user.target

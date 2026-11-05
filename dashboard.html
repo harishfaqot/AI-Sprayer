@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prototype Sprayer Weeder — Dashboard</title>
+<style>
+  :root {
+    --bg:#f3f6f3; --card:#ffffff; --txt:#14211a; --mut:#667269; --bd:#dde4de;
+    --grn:#16a34a; --grn-d:#0f7a37; --grn-bg:#e3f5ea;
+    --red:#dc2626; --red-bg:#fdeaea; --ylw:#d97706; --ylw-bg:#fdf1dc;
+    --blu:#2563eb; --cyan:#0ea5e9; --video-bg:#0b100d; --shadow:0 1px 2px rgba(0,0,0,.05);
+  }
+  :root { color-scheme:light; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt);
+         font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  .mono { font-family:ui-monospace,"Cascadia Mono",Consolas,monospace; }
+
+  /* ── top bar ── */
+  header.top { position:sticky; top:0; z-index:5; display:flex; align-items:center; gap:12px; flex-wrap:wrap;
+               padding:10px 20px; background:var(--card); border-bottom:1px solid var(--bd); }
+  .brand { font-weight:800; font-size:1.05rem; letter-spacing:.02em; color:var(--grn-d); white-space:nowrap; }
+  .badge { padding:3px 10px; border-radius:999px; font-size:.75rem; font-weight:700;
+           background:var(--grn-bg); color:var(--grn-d); }
+  .badge.off { background:var(--bd); color:var(--mut); }
+  .spacer { flex:1; }
+  .chip { padding:3px 10px; border-radius:999px; border:1px solid var(--bd); font-size:.78rem; color:var(--mut); white-space:nowrap; }
+  .chip.warn { background:var(--ylw-bg); color:var(--ylw); border-color:transparent; font-weight:700; }
+  .chip.hot  { background:var(--red-bg); color:var(--red); border-color:transparent; font-weight:700; }
+  .btn { border:0; border-radius:8px; padding:9px 18px; font:inherit; font-weight:700; cursor:pointer; color:#fff; }
+  .btn:disabled { opacity:.4; cursor:default; }
+  .btn-grn { background:var(--grn); }  .btn-red { background:var(--red); }  .btn-gry { background:#52605a; padding:6px 12px; }
+  .btn-big { padding:10px 22px; font-size:1rem; }
+
+  /* ── tabs ── */
+  nav.tabs { display:flex; gap:4px; padding:0 20px; background:var(--card); border-bottom:1px solid var(--bd); overflow-x:auto; }
+  nav.tabs button { border:0; background:none; padding:11px 16px; font:inherit; font-weight:600; color:var(--mut);
+                    cursor:pointer; border-bottom:3px solid transparent; white-space:nowrap; }
+  nav.tabs button.active { color:var(--grn-d); border-bottom-color:var(--grn); }
+
+  main { max-width:1560px; margin:0 auto; padding:16px 20px 40px; }
+  .panel { display:none; }  .panel.active { display:block; }
+  .layout { display:grid; grid-template-columns:minmax(0,1fr) 340px; gap:16px; align-items:start; }
+  .stack { display:flex; flex-direction:column; gap:14px; }
+  .layout > *, .pid-grid > * { min-width:0; }
+  .card { background:var(--card); border:1px solid var(--bd); border-radius:12px; padding:14px 16px; box-shadow:var(--shadow); }
+  .card h2 { margin:0 0 10px; font-size:.78rem; font-weight:800; letter-spacing:.06em; text-transform:uppercase; color:var(--mut); }
+
+  /* ── video ── */
+  .video-wrap { position:relative; width:100%; max-width:1280px; aspect-ratio:16/9; background:var(--video-bg);
+                border-radius:12px; overflow:hidden; display:flex; align-items:center; justify-content:center; }
+  .video-wrap img { width:100%; height:100%; object-fit:contain; display:none; }
+  .placeholder { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center;
+                 gap:8px; color:#9db0a3; text-align:center; padding:20px; }
+  .placeholder .icon { font-size:2.6rem; }  .placeholder b { color:#e8efe9; font-size:1.1rem; }
+  .src-bar { display:flex; align-items:center; gap:10px; margin-top:10px; max-width:1280px; }
+  .src-bar label { font-size:.8rem; font-weight:700; color:var(--mut); white-space:nowrap; }
+  .src-bar input { flex:1; min-width:0; padding:9px 12px; border:1px solid var(--bd); border-radius:8px; background:var(--card);
+                   color:var(--txt); font:inherit; }
+  details.legend { margin-top:10px; max-width:1280px; }
+  details.legend summary { cursor:pointer; color:var(--grn-d); font-weight:600; font-size:.88rem; }
+  .legend-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(230px,1fr)); gap:6px 14px; margin-top:8px;
+                 font-size:.84rem; color:var(--mut); }
+  .legend-grid span { display:inline-flex; align-items:center; gap:7px; }
+  .sw { width:16px; height:11px; border-radius:3px; display:inline-block; flex:none; }
+  .sw.line { height:3px; }
+
+  /* ── tiles ── */
+  .tiles { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+  .tile.wide { grid-column:1 / -1; }
+  .tile { border-radius:10px; padding:10px 12px; background:var(--bg); border:1px solid var(--bd); min-width:0; }
+  .tile .lbl { font-size:.7rem; font-weight:800; letter-spacing:.05em; text-transform:uppercase; color:var(--mut); }
+  .tile .val { font-size:1.1rem; font-weight:800; margin-top:2px; line-height:1.2; overflow-wrap:anywhere; }
+  .tile .sub { font-size:.76rem; color:var(--mut); margin-top:2px; }
+  .tile.on  { background:var(--grn-bg); border-color:transparent; }  .tile.on .val  { color:var(--grn-d); }
+  .tile.bad { background:var(--red-bg); border-color:transparent; }  .tile.bad .val { color:var(--red); }
+  .tile .val.big { font-size:1.6rem; }
+  .track { height:8px; border-radius:99px; background:var(--bd); overflow:hidden; margin-top:6px; }
+  .fill { height:100%; width:0; background:var(--grn); border-radius:99px; transition:width .25s, background .25s; }
+  .row { display:flex; justify-content:space-between; gap:10px; padding:7px 0; border-bottom:1px solid var(--bd); font-size:.9rem; }
+  .row:last-child { border-bottom:0; }  .row .k { color:var(--mut); }  .row .v { font-weight:700; text-align:right; }
+  svg.servo { width:100%; height:92px; display:block; }
+
+  /* ── PID tab ── */
+  .pid-grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  .pid-chart canvas { width:100%; height:200px; display:block; background:var(--bg); border-radius:8px; }
+  .pid-hdr { display:flex; justify-content:space-between; gap:8px; flex-wrap:wrap; font-size:.82rem; color:var(--mut); margin-bottom:6px; }
+  .pid-hdr b { color:var(--txt); }
+  .lg i { display:inline-block; width:14px; height:3px; vertical-align:middle; margin:0 4px 0 10px; }
+  .gains { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-top:10px; }
+  .gains label { font-size:.78rem; font-weight:700; color:var(--mut); }
+  .gains input { width:72px; padding:6px 8px; border:1px solid var(--bd); border-radius:6px; background:var(--card);
+                 color:var(--txt); font:inherit; }
+  .note { font-size:.84rem; color:var(--mut); line-height:1.6; }
+  .note ul { margin:6px 0 0 18px; padding:0; }
+  .actions { display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-top:14px; }
+  table.metrics { width:100%; border-collapse:collapse; font-size:.84rem; margin-top:10px; }
+  table.metrics th, table.metrics td { padding:6px 8px; text-align:right; border-bottom:1px solid var(--bd); }
+  table.metrics th { color:var(--mut); font-weight:700; }
+  table.metrics td:first-child, table.metrics th:first-child { text-align:left; }
+
+  /* ── log ── */
+  .log-box { height:60vh; overflow-y:auto; background:var(--bg); border-radius:8px; padding:10px 12px;
+             font-family:ui-monospace,Consolas,monospace; font-size:.82rem; }
+  .log-line { color:var(--mut); padding:2px 0; }  .log-line span { color:var(--txt); }
+
+  @media (max-width: 1000px) {
+    .layout, .pid-grid { grid-template-columns:minmax(0,1fr); }
+    header.top { padding:10px 14px; }  main { padding:12px 14px 40px; }  nav.tabs { padding:0 8px; }
+  }
+  @media (max-width: 520px) {
+    .btn-big { padding:9px 14px; }  .brand { font-size:.92rem; white-space:normal; }
+  }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="brand">⬡ PROTOTYPE SPRAYER WEEDER</div>
+  <div id="runBadge" class="badge off">DIHENTIKAN</div>
+  <div class="spacer"></div>
+  <div class="chip mono" id="fpsChip">-- FPS</div>
+  <div class="chip mono" id="tempChip" hidden></div>
+  <button class="btn btn-grn btn-big" id="btnStart" onclick="startStream()">▶ MULAI</button>
+  <button class="btn btn-red btn-big" id="btnStop" onclick="stopStream()" disabled>■ BERHENTI</button>
+</header>
+
+<nav class="tabs">
+  <button class="active" data-tab="monitor" onclick="showTab('monitor')">Pantau</button>
+  <button data-tab="pid" onclick="showTab('pid')">Kontrol PID (lanjutan)</button>
+  <button data-tab="log" onclick="showTab('log')">Catatan</button>
+</nav>
+
+<main>
+
+<!-- ═════════ TAB: PANTAU ═════════ -->
+<section class="panel active" id="tab-monitor">
+  <div class="layout">
+
+    <div>
+      <div class="video-wrap" id="videoWrap">
+        <div class="placeholder" id="videoPlaceholder">
+          <div class="icon">📷</div>
+          <b>Video belum berjalan</b>
+          <div>Tekan <b>▶ MULAI</b> di kanan atas untuk memulai deteksi gulma.</div>
+        </div>
+        <img id="videoImg" src="" alt="Video deteksi"
+             onerror="this.style.display='none'; document.getElementById('videoPlaceholder').style.display='flex'">
+      </div>
+
+      <div class="src-bar">
+        <label for="srcInput">SUMBER VIDEO</label>
+        <input type="text" id="srcInput" list="srcList" value="{{ source }}" placeholder="0 = kamera, atau pilih file video">
+        <datalist id="srcList"></datalist>
+      </div>
+
+      <details class="legend">
+        <summary>Arti warna dan garis di video</summary>
+        <div class="legend-grid">
+          <span><i class="sw" style="background:#FF8C00"></i>Rumput Teki</span>
+          <span><i class="sw" style="background:#DC3CC8"></i>Babandotan</span>
+          <span><i class="sw" style="background:#288CFF"></i>Rumput Belulang</span>
+          <span><i class="sw" style="border:2px solid #FFD700"></i>Area semprot (menunggu)</span>
+          <span><i class="sw" style="border:2px solid #53D339"></i>Area semprot (sedang menyemprot)</span>
+          <span><i class="sw" style="background:#F85149;opacity:.7"></i>Gulma di dalam area semprot</span>
+          <span><b style="color:#F85149">+</b>Pusat gulma (titik bidik)</span>
+          <span><i class="sw line" style="background:#F85149"></i>Sudut target nozzle</span>
+          <span><i class="sw line" style="background:#00DCFF;height:5px"></i>Sudut nozzle saat ini</span>
+          <span><i class="sw" style="background:#00DCFF;opacity:.4"></i>Semprotan</span>
+        </div>
+      </details>
+    </div>
+
+    <aside class="stack">
+
+      <div class="card">
+        <h2>Kondisi sekarang</h2>
+        <div class="tiles">
+          <div class="tile" id="tileGrass">
+            <div class="lbl">Gulma</div>
+            <div class="val" id="statusText">TIDAK ADA</div>
+            <div class="sub" id="statInstSub">0 objek</div>
+          </div>
+          <div class="tile" id="tilePump">
+            <div class="lbl">Pompa</div>
+            <div class="val" id="pumpBox">MATI</div>
+            <div class="sub">penyemprot</div>
+          </div>
+          <div class="tile wide">
+            <div class="lbl">Bukaan nozzle</div>
+            <div class="val big" id="nozzlePct">0%</div>
+            <div class="track"><div class="fill" id="progressFill"></div></div>
+            <div class="sub" id="nozzleSp">Target: 0%</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Arah nozzle</h2>
+        <svg class="servo" viewBox="0 0 240 92">
+          <line x1="20" y1="82" x2="220" y2="82" stroke="var(--bd)" stroke-width="6" stroke-linecap="round"/>
+          <line x1="120" y1="76" x2="120" y2="88" stroke="var(--mut)" stroke-width="1"/>
+          <polygon id="servoSpray" points="120,14 120,80 120,80" fill="#0EA5E9" opacity="0.3"/>
+          <line id="servoArm" x1="120" y1="14" x2="120" y2="40" stroke="#A1A1AA" stroke-width="5" stroke-linecap="round"/>
+          <rect x="108" y="6" width="24" height="16" rx="3" fill="#27272A"/>
+          <circle cx="120" cy="14" r="3" fill="#fff"/>
+          <text x="6" y="90" font-size="10" fill="var(--mut)">Kiri</text>
+          <text x="208" y="90" font-size="10" fill="var(--mut)">Kanan</text>
+        </svg>
+        <div class="row"><span class="k">Arah</span><span class="v" id="servoDir">TENGAH</span></div>
+        <div class="row"><span class="k">Sudut sekarang</span><span class="v mono" id="servoAngle">90°</span></div>
+        <div class="row"><span class="k">Sudut target</span><span class="v mono" id="servoSp">0°</span></div>
+      </div>
+
+      <div class="card">
+        <h2>Pengukuran</h2>
+        <div class="row"><span class="k">Luas gulma (seluruh gambar)</span><span class="v mono" id="statArea">0 px²</span></div>
+        <div class="row"><span class="k">Luas gulma (area semprot)</span><span class="v mono" id="statRoiArea">0 px²</span></div>
+        <div class="row"><span class="k">Tutupan area semprot</span><span class="v mono" id="statCoverage">0%</span></div>
+        <div class="row"><span class="k">Objek terdeteksi sekarang</span><span class="v mono" id="statInst">0</span></div>
+        <div class="row"><span class="k">Jumlah gambar yang ada gulma</span><span class="v mono" id="detectCount">0</span></div>
+      </div>
+
+      <div class="card">
+        <h2>Penggunaan sistem</h2>
+        <div class="row"><span class="k">CPU</span><span class="v mono" id="sysCpu">--</span></div>
+        <div class="track"><div class="fill" id="sysCpuBar"></div></div>
+        <div class="row"><span class="k">Memori (RAM)</span><span class="v mono" id="sysRam">--</span></div>
+        <div class="track"><div class="fill" id="sysRamBar"></div></div>
+        <div class="row"><span class="k">Suhu</span><span class="v mono" id="sysTemp">--</span></div>
+        <div class="row"><span class="k">Waktu proses AI per gambar</span><span class="v mono" id="sysInfer">--</span></div>
+      </div>
+
+    </aside>
+  </div>
+</section>
+
+<!-- ═════════ TAB: PID ═════════ -->
+<section class="panel" id="tab-pid">
+  <div class="card" style="margin-bottom:16px">
+    <h2>Apa ini? <span id="pidMode" style="float:right;color:var(--grn-d)"></span></h2>
+    <div class="note">
+      Kamera menentukan <b>target</b> untuk dua servo: <b>servo sudut</b> (mengarahkan nozzle ke kiri/kanan, ke arah gulma)
+      dan <b>servo nozzle</b> (membuka nozzle lebih besar jika gulma lebih banyak). Target berubah setiap gambar dan bisa melompat.
+      <b>Pengatur PID</b> menggerakkan tiap servo menuju targetnya dengan halus: cepat saat masih jauh, melambat saat mendekat,
+      tanpa kebablasan atau bergetar. Dihitung 200 kali per detik, hanya di perangkat lunak (servo masih simulasi).
+      <ul>
+        <li><b>Kp</b> (dorongan): makin besar = reaksi makin cepat. Terlalu besar = kebablasan / bergetar.</li>
+        <li><b>Ki</b> (menghilangkan sisa selisih): jaga tetap kecil. Terlalu besar = kebablasan dan lama menetap.</li>
+        <li><b>Kd</b> (rem): makin besar = makin sedikit kebablasan. Terlalu besar = lamban / bergetar.</li>
+      </ul>
+      Pengaturan yang baik: garis biru mengikuti garis merah putus-putus dengan cepat, tanpa melewatinya.
+    </div>
+  </div>
+
+  <div class="pid-grid">
+    <div class="card pid-chart">
+      <div class="pid-hdr">
+        <span><b>Servo sudut</b> (derajat, − kiri / + kanan)</span>
+        <span class="lg"><i style="background:#DC2626"></i>Target<i style="background:#2563EB"></i>Kenyataan</span>
+      </div>
+      <canvas id="chartServo"></canvas>
+      <div class="gains">
+        <label title="Dorongan: makin besar = makin cepat">Kp</label><input id="servo_kp" type="number" step="any">
+        <label title="Menghilangkan sisa selisih: jaga tetap kecil">Ki</label><input id="servo_ki" type="number" step="any">
+        <label title="Rem: makin besar = makin sedikit kebablasan">Kd</label><input id="servo_kd" type="number" step="any">
+        <button class="btn btn-gry" onclick="applyGains('servo')">TERAPKAN</button>
+      </div>
+    </div>
+    <div class="card pid-chart">
+      <div class="pid-hdr">
+        <span><b>Servo nozzle</b> (bukaan %)</span>
+        <span class="lg"><i style="background:#DC2626"></i>Target<i style="background:#2563EB"></i>Kenyataan</span>
+      </div>
+      <canvas id="chartNozzle"></canvas>
+      <div class="gains">
+        <label title="Dorongan: makin besar = makin cepat">Kp</label><input id="nozzle_kp" type="number" step="any">
+        <label title="Menghilangkan sisa selisih: jaga tetap kecil">Ki</label><input id="nozzle_ki" type="number" step="any">
+        <label title="Rem: makin besar = makin sedikit kebablasan">Kd</label><input id="nozzle_kd" type="number" step="any">
+        <button class="btn btn-gry" onclick="applyGains('nozzle')">TERAPKAN</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <h2>Uji step</h2>
+    <div class="note"><b>UJI STEP</b> memberi target tetap (sudut 0 → +30° → −30° → 0, nozzle 0 → 80% → 30% → 0)
+      untuk mengukur seberapa bagus pengaturannya.</div>
+    <div class="actions">
+      <button class="btn btn-grn" id="btnStep" onclick="stepTest()">UJI STEP</button>
+      <span class="note mono" id="pidLog">Log CSV: —</span>
+    </div>
+    <div class="note" id="metricsHelp" hidden style="margin-top:12px">
+      <b>Waktu naik</b> = waktu bergerak dari 10% sampai 90% jarak ke target (makin kecil makin cepat) ·
+      <b>Kebablasan</b> = seberapa jauh servo melewati target (makin kecil makin baik) ·
+      <b>Waktu stabil</b> = waktu sampai servo menetap di target ±2% (makin kecil makin baik) ·
+      <b>Selisih akhir</b> = sisa selisih di akhir (makin mendekati 0 makin baik)
+    </div>
+    <table class="metrics" id="metricsTable" hidden>
+      <thead><tr><th>Servo</th><th>Perubahan target</th><th>Waktu naik (dtk)</th><th>Kebablasan</th><th>Waktu stabil (dtk)</th><th>Selisih akhir</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ═════════ TAB: CATATAN ═════════ -->
+<section class="panel" id="tab-log">
+  <div class="card">
+    <h2>Catatan sistem</h2>
+    <div class="log-box" id="logBox"></div>
+  </div>
+</section>
+
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const SERVO_INVERT = {{ servo_invert }};
+const NOZZLE_HEIGHT = {{ nozzle_height }};
+let lastPump = false;
+
+// ── Tabs ──────────────────────────────────────────────────────────────────────
+function showTab(name) {
+  document.querySelectorAll(".panel").forEach(p => p.classList.toggle("active", p.id === "tab-" + name));
+  document.querySelectorAll("nav.tabs button").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
+  try { localStorage.setItem("tab", name); } catch (e) {}
+}
+try { const t = localStorage.getItem("tab"); if (t && $("tab-" + t)) showTab(t); } catch (e) {}
+if ($("tab-" + location.hash.slice(1))) showTab(location.hash.slice(1));      // e.g. /#pid
+
+// ── Log ───────────────────────────────────────────────────────────────────────
+function log(msg) {
+  const box = $("logBox");
+  box.innerHTML += `<div class="log-line">[${new Date().toLocaleTimeString()}] <span>${msg}</span></div>`;
+  box.scrollTop = box.scrollHeight;
+}
+
+// ── Live data (SSE) ───────────────────────────────────────────────────────────
+let es = null;
+function connectSSE() {
+  if (es) es.close();
+  es = new EventSource("/stats_stream");
+  es.onmessage = (e) => {
+    const d = JSON.parse(e.data);
+    if (d.event === "stopped") { onStopped(d.reason); return; }
+    if (d.event === "started") return;
+    updateUI(d);
+  };
+  es.onerror = () => setTimeout(connectSSE, 3000);
+}
+
+function updateUI(d) {
+  $("fpsChip").textContent = `${d.fps ?? "--"} FPS`;
+
+  const found = !!d.grass_detected;
+  $("tileGrass").className = "tile" + (found ? " on" : "");
+  $("statusText").textContent = found ? "ADA" : "TIDAK ADA";
+  $("statInstSub").textContent = `${d.n_detected ?? 0} objek`;
+
+  lastPump = !!d.pump_on;
+  $("tilePump").className = "tile" + (d.pump_on ? " on" : "");
+  $("pumpBox").textContent = d.pump_on ? "NYALA" : "MATI";
+
+  $("statArea").textContent     = `${(d.grass_area_px ?? 0).toLocaleString("id-ID")} px²`;
+  $("statRoiArea").textContent  = `${(d.roi_grass_px ?? 0).toLocaleString("id-ID")} px²`;
+  $("statCoverage").textContent = `${d.roi_coverage ?? 0}%`;
+  $("statInst").textContent     = d.n_detected ?? 0;
+  $("detectCount").textContent  = (d.detect_count ?? 0).toLocaleString("id-ID");
+  $("servoDir").textContent     = d.direction ?? "TENGAH";
+  $("sysInfer").textContent     = d.infer_ms ? `${d.infer_ms} ms` : "--";
+}
+
+// ── Actuators (PID PV) ────────────────────────────────────────────────────────
+function barColor(pct) { return pct < 60 ? "var(--grn)" : pct < 85 ? "var(--ylw)" : "var(--red)"; }
+function setBar(id, pct) { const e = $(id); e.style.width = `${pct}%`; e.style.background = barColor(pct); }
+
+function updateActuators(p) {
+  const pct = Math.round(p.nozzle_pv);
+  $("nozzlePct").textContent = `${pct}%`;
+  $("nozzleSp").textContent  = `Target: ${Math.round(p.nozzle_sp)}%`;
+  setBar("progressFill", pct);
+
+  const pan = p.servo_pv * Math.PI / 180;
+  const hit = Math.max(-1, Math.min(1, Math.tan(pan) * NOZZLE_HEIGHT));
+  const hx  = 120 + hit * 100;
+  const spraying = (lastPump || p.mode === "step") && pct > 1;
+  const arm = $("servoArm");
+  arm.setAttribute("x2", 120 + 26 * Math.sin(pan));
+  arm.setAttribute("y2", 14 + 26 * Math.cos(pan));
+  arm.setAttribute("stroke", spraying ? "#0EA5E9" : "#A1A1AA");
+  const hw = spraying ? 6 + 20 * pct / 100 : 0;
+  $("servoSpray").setAttribute("points", `120,14 ${hx - hw},80 ${hx + hw},80`);
+  const ang = 90 + (SERVO_INVERT ? -1 : 1) * p.servo_pv;
+  $("servoAngle").textContent = `${ang.toFixed(1)}°`;
+  $("servoSp").textContent    = `${p.servo_sp >= 0 ? "+" : ""}${p.servo_sp.toFixed(1)}°`;
+}
+
+// ── System usage (CPU / RAM / temperature) ────────────────────────────────────
+async function pollSystem() {
+  try {
+    const s = await (await fetch("/api/system")).json();
+    if (s.cpu != null) { $("sysCpu").textContent = `${s.cpu.toFixed(0)}%`; setBar("sysCpuBar", s.cpu); }
+    if (s.ram != null) {
+      $("sysRam").textContent = `${s.ram_used_mb} / ${s.ram_total_mb} MB (${s.ram.toFixed(0)}%)`;
+      setBar("sysRamBar", s.ram);
+    }
+    if (s.temp != null) {
+      $("sysTemp").textContent = `${s.temp.toFixed(0)} °C`;
+      const chip = $("tempChip");
+      chip.hidden = false;
+      chip.textContent = `${s.temp.toFixed(0)} °C`;
+      chip.className = "chip mono" + (s.temp >= 88 ? " hot" : s.temp >= 75 ? " warn" : "");
+      chip.title = s.temp >= 75 ? "Suhu tinggi: alat memperlambat dirinya sendiri. Pasang heatsink dan kipas." : "Suhu normal";
+    }
+  } catch (e) {}
+  setTimeout(pollSystem, 2000);
+}
+
+// ── PID charts ────────────────────────────────────────────────────────────────
+const WINDOW_S = 10;
+let pidHist = [], pidSince = -1, pidNow = 0, lastMode = "vision";
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+function drawChart(id, iSp, iPv, yMin, yMax) {
+  const cv = $(id);
+  const dpr = window.devicePixelRatio || 1;
+  const W = cv.clientWidth, H = cv.clientHeight;
+  if (!W) return;                                   // tab is hidden
+  if (cv.width !== Math.round(W * dpr)) { cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr); }
+  const g = cv.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, W, H);
+  const L = 34, R = 8, T = 8, B = 18;
+  const t0 = pidNow - WINDOW_S;
+  const X = t => L + (t - t0) / WINDOW_S * (W - L - R);
+  const Y = v => T + (1 - (v - yMin) / (yMax - yMin)) * (H - T - B);
+
+  g.font = "11px system-ui, sans-serif"; g.fillStyle = css("--mut"); g.strokeStyle = css("--bd"); g.lineWidth = 1;
+  for (let k = 0; k <= 4; k++) {
+    const v = yMin + (yMax - yMin) * k / 4, y = Y(v);
+    g.beginPath(); g.moveTo(L, y); g.lineTo(W - R, y); g.stroke();
+    g.fillText(Math.round(v), 4, y + 4);
+  }
+  for (let s = 0; s <= WINDOW_S; s += 2) g.fillText(`-${WINDOW_S - s}s`, X(t0 + s) - 10, H - 4);
+
+  const pts = pidHist.filter(h => h[0] >= t0);
+  const line = (fn, col, w, dash) => {
+    g.strokeStyle = col; g.lineWidth = w; g.setLineDash(dash || []); g.beginPath();
+    pts.forEach((h, k) => { const x = X(h[0]), y = fn(h); k ? g.lineTo(x, y) : g.moveTo(x, y); });
+    g.stroke(); g.setLineDash([]);
+  };
+  line(h => Y(h[iSp]), "#DC2626", 1.8, [5, 4]);
+  line(h => Y(h[iPv]), "#2563EB", 2.2);
+}
+
+async function pollPid() {
+  try {
+    const d = await (await fetch(`/api/pid/history?since=${pidSince}`)).json();
+    if (d.now < pidSince) { pidHist = []; pidSince = -1; }       // the server restarted
+    if (d.samples.length) {
+      pidHist.push(...d.samples);
+      pidSince = d.samples[d.samples.length - 1][0];
+      pidHist = pidHist.filter(h => h[0] >= pidSince - WINDOW_S - 1);
+    }
+    pidNow = d.now;
+    drawChart("chartServo",  1, 2, -60, 60);
+    drawChart("chartNozzle", 4, 5, 0, 100);
+
+    const p = await (await fetch("/api/pid")).json();
+    updateActuators(p);
+    $("pidMode").textContent = p.mode === "step" ? "UJI STEP BERJALAN…" : "";
+    $("btnStep").disabled = p.mode === "step";
+    if (p.log) $("pidLog").textContent = `Log CSV: ${p.log}`;
+    if (lastMode === "step" && p.mode !== "step") { showMetrics(p.metrics); log("Uji step selesai."); }
+    lastMode = p.mode;
+  } catch (e) {}
+  setTimeout(pollPid, 250);
+}
+
+function fillGains(g) {
+  for (const loop of ["servo", "nozzle"])
+    for (const k of ["kp", "ki", "kd"]) $(`${loop}_${k}`).value = g[loop][k];
+}
+
+async function applyGains(loop) {
+  const v = k => parseFloat($(`${loop}_${k}`).value);
+  const body = {loop, kp: v("kp"), ki: v("ki"), kd: v("kd")};
+  const d = await (await fetch("/api/pid", {method: "POST",
+    headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)})).json();
+  if (d.ok) { fillGains(d.gains); log(`Pengaturan ${loop} → Kp=${body.kp} Ki=${body.ki} Kd=${body.kd}`); }
+  else log(`GALAT: ${d.msg}`);
+}
+
+async function stepTest() {
+  const d = await (await fetch("/api/pid/step", {method: "POST"})).json();
+  log(d.ok ? "Uji step dimulai." : `GALAT: ${d.msg}`);
+}
+
+function showMetrics(m) {
+  const tb = document.querySelector("#metricsTable tbody");
+  tb.innerHTML = "";
+  for (const loop of ["servo", "nozzle"]) {
+    const unit = loop === "servo" ? "°" : "%";
+    for (const r of (m[loop] || [])) {
+      tb.innerHTML += `<tr><td>${loop === "servo" ? "Sudut" : "Nozzle"}</td><td>${r.from}→${r.to}${unit}</td>` +
+        `<td>${r.rise_time ?? "—"}</td><td>${r.overshoot_pct}%</td>` +
+        `<td>${r.settling_time}</td><td>${r.sse}${unit}</td></tr>`;
+    }
+  }
+  $("metricsTable").hidden = false;
+  $("metricsHelp").hidden  = false;
+  if (m.log) $("pidLog").textContent = `Log CSV: ${m.log}`;
+}
+
+// ── Start / stop ──────────────────────────────────────────────────────────────
+function showRunning(on) {
+  $("btnStart").disabled = on;
+  $("btnStop").disabled  = !on;
+  $("runBadge").textContent = on ? "BERJALAN" : "DIHENTIKAN";
+  $("runBadge").className   = on ? "badge" : "badge off";
+  const img = $("videoImg");
+  if (on) {
+    img.src = `/video_feed?t=${Date.now()}`;
+    img.style.display = "block";
+    $("videoPlaceholder").style.display = "none";
+  } else {
+    img.style.display = "none";
+    $("videoPlaceholder").style.display = "flex";
+  }
+}
+
+async function startStream() {
+  const src = $("srcInput").value.trim();
+  log(`Memulai → ${src}`);
+  const data = await (await fetch("/api/start", {
+    method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({source: src})
+  })).json();
+  if (data.ok) { showRunning(true); log("Video dimulai."); }
+  else { log(`GALAT: ${data.msg}`); alert(data.msg); }
+}
+
+async function stopStream() {
+  await fetch("/api/stop", {method: "POST"});
+  onStopped("user");
+}
+
+function onStopped(reason) {
+  showRunning(false);
+  const why = ({user: "tombol BERHENTI ditekan", end_of_source: "video sudah selesai"})[reason] ?? reason ?? "tidak diketahui";
+  log(`Dihentikan. Alasan: ${why}`);
+}
+
+async function loadSources() {
+  try {
+    const list = await (await fetch("/api/sources")).json();
+    $("srcList").innerHTML = list.map(s => `<option value="${s}">${s === "0" ? "Kamera" : ""}</option>`).join("");
+  } catch (e) {}
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+connectSSE();
+log("Dashboard terhubung.");
+loadSources();
+
+fetch("/api/state").then(r => r.json()).then(d => {
+  if (d.running) { showRunning(true); log("Tersambung kembali ke sesi yang sedang berjalan."); }
+  updateUI(d);
+});
+fetch("/api/pid").then(r => r.json()).then(p => {
+  fillGains(p.gains);
+  if (p.metrics && p.metrics.servo) showMetrics(p.metrics);
+});
+pollPid();
+pollSystem();
+</script>
+</body>
+</html>

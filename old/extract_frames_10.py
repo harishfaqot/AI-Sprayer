@@ -1,7 +1,7 @@
 import cv2
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(__file__).resolve().parent.parent
 VIDEO_DIR = BASE_DIR / "video"
 OUTPUT_DIR = VIDEO_DIR / "frames_all"
 FRAME_SKIP = 10

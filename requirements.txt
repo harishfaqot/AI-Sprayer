@@ -1,0 +1,4 @@
+# Paket yang dibutuhkan main_web.py (ultralytics sudah membawa numpy, opencv, dan torch)
+ultralytics
+flask
+psutil

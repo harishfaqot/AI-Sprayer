@@ -1,1 +1,13 @@
-/models
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# log PID hasil setiap kali program dijalankan (dibuat otomatis)
+/logs/
+
+# video lapangan terlalu besar untuk GitHub (>100 MB per file), simpan terpisah
+video/real[123].mp4
+
+# model ONNX hasil ekspor (dibuat ulang dari best.pt)
+runs/segment/train-9/weights/*.onnx

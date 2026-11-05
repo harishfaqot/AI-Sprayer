@@ -1,2 +1,6 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# file untuk Linux (Orange Pi) harus tetap LF
+*.sh text eol=lf
+*.service text eol=lf
